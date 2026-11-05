@@ -8,9 +8,8 @@
   <title>SpotiStats</title>
   <meta
     name="description"
-    content="Explore your Spotify listening statistics privately. Your data stays in your browser."
+    content="Explore your Spotify listening statistics privately. Your listening history stays in your browser."
   >
-
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link
@@ -23,7 +22,6 @@
 
 <body>
   <main class="page-shell">
-
     <header class="site-header">
       <a class="brand" href="./">
         <span class="brand-icon">♫</span>
@@ -64,7 +62,6 @@
         </div>
 
         <label class="drop-zone" id="drop-zone" for="file-input">
-
           <div class="upload-icon">
             <svg
               viewBox="0 0 24 24"
@@ -99,7 +96,6 @@
             accept=".zip,application/zip,application/x-zip-compressed"
             hidden
           >
-
         </label>
 
         <div class="selected-file" id="selected-file" hidden>
@@ -160,7 +156,6 @@
     </section>
 
     <section class="privacy-card">
-
       <div class="privacy-icon">
         <svg
           viewBox="0 0 24 24"
@@ -180,25 +175,38 @@
         <h3>Your data stays yours.</h3>
 
         <p>
-          Your Spotify listening history is processed entirely in your
-          browser. Your file is never uploaded to our servers, and we do
-          not store, collect, or share your listening history.
+          Your Spotify ZIP file is read and processed directly in your
+          browser. It is never uploaded to SpotiStats, and we do not operate
+          user accounts or a database containing your listening history.
         </p>
 
-        <span class="privacy-note">
-          NO ACCOUNTS &nbsp;·&nbsp; NO DATABASE &nbsp;·&nbsp; NO DATA STORAGE
-        </span>
-      </div>
+        <p>
+          <strong>About automatic metadata:</strong>
+          SpotiStats will contact external music metadata and artwork
+          providers to retrieve artist information, genres, and images.
+          These providers may receive the artist or album names being
+          searched for, along with ordinary connection information such
+          as your IP address.
+        </p>
 
-    </section>
+        <p>
+          These requests do not include your ZIP file, listening timestamps,
+          play counts, or complete listening history. Your statistics are
+          calculated in your browser and are not sent to those providers.
+        </p>
 
+        <p>
+          Imported listening data and retrieved metadata are kept in
+          temporary browser memory for the current session. They are not
+          saved to local storage or a permanent database.
+        </p>
     <footer class="site-footer">
       <span>SPOTISTATS</span>
     </footer>
 
   </main>
 
-<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
-<script src="app.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+  <script src="app.js"></script>
 </body>
 </html>
