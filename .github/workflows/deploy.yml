@@ -1,0 +1,73 @@
+
+name: Deploy SpotiStats to GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Update asset versions
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          version = os.environ["GITHUB_SHA"]
+
+          for file in Path(".").glob("*.html"):
+              content = file.read_text(encoding="utf-8")
+
+              pattern = r'((?:href|src)=["\'])(\.?/?(?:style\.css|app\.js))(?:\?[^"\']*)?(["\'])'
+
+              content = re.sub(
+                  pattern,
+                  lambda match: (
+                      match.group(1)
+                      + match.group(2)
+                      + "?v="
+                      + version
+                      + match.group(3)
+                  ),
+                  content
+              )
+
+              file.write_text(content, encoding="utf-8")
+
+          print(f"Assets updated to version: {version}")
+          PY
+
+      - name: Upload website
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: .
+
+      - name: Deploy website
+        id: deployment
+        uses: actions/deploy-pages@v4
