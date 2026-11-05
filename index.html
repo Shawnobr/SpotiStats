@@ -1,0 +1,203 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+  <title>SpotiStats</title>
+  <meta
+    name="description"
+    content="Explore your Spotify listening statistics privately. Your data stays in your browser."
+  >
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap"
+    rel="stylesheet"
+  >
+
+  <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+  <main class="page-shell">
+
+    <header class="site-header">
+      <a class="brand" href="./">
+        <span class="brand-icon">♫</span>
+        <span>SpotiStats</span>
+      </a>
+
+      <span class="header-label">
+        PERSONAL LISTENING ANALYTICS
+      </span>
+    </header>
+
+    <section class="upload-section">
+
+      <div class="eyebrow">
+        <span class="status-dot"></span>
+        YOUR MUSIC, YOUR DATA
+      </div>
+
+      <h1>
+        Your listening history.<br>
+        <span>Under your control.</span>
+      </h1>
+
+      <p class="intro">
+        Explore your Spotify listening habits, discover your most-played
+        artists, and uncover statistics from your entire listening history.
+      </p>
+
+      <div class="upload-card">
+
+        <div class="upload-heading">
+          <div>
+            <span class="section-label">GET STARTED</span>
+            <h2>Upload your Spotify data</h2>
+          </div>
+
+          <span class="file-type">.ZIP</span>
+        </div>
+
+        <label class="drop-zone" id="drop-zone" for="file-input">
+
+          <div class="upload-icon">
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.6"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M12 16V4"></path>
+              <path d="m7 9 5-5 5 5"></path>
+              <path d="M20 16.5v2A1.5 1.5 0 0 1 18.5 20h-13A1.5 1.5 0 0 1 4 18.5v-2"></path>
+            </svg>
+          </div>
+
+          <span class="drop-title">
+            Drop your Spotify ZIP file here
+          </span>
+
+          <span class="drop-subtitle">
+            or click to browse your files
+          </span>
+
+          <span class="browse-button">
+            Choose file
+          </span>
+
+          <input
+            type="file"
+            id="file-input"
+            accept=".zip,application/zip,application/x-zip-compressed"
+            hidden
+          >
+
+        </label>
+
+        <div class="selected-file" id="selected-file" hidden>
+          <div class="selected-file-info">
+            <span class="file-icon">ZIP</span>
+            <div>
+              <span class="selected-file-name" id="file-name"></span>
+              <span class="selected-file-size" id="file-size"></span>
+            </div>
+          </div>
+
+          <button
+            class="remove-file"
+            id="remove-file"
+            type="button"
+            aria-label="Remove selected file"
+          >
+            &times;
+          </button>
+        </div>
+
+        <div class="validation-message" id="validation-message" hidden>
+          <span id="validation-text"></span>
+        </div>
+
+        <button
+          class="process-button"
+          id="process-button"
+          type="button"
+          disabled
+        >
+          Process listening history
+          <span>→</span>
+        </button>
+
+        <div class="upload-footer">
+          <span>SUPPORTED FORMAT</span>
+          <span>Spotify Extended Streaming History</span>
+        </div>
+
+      </div>
+
+      <div class="guide-link">
+        <span class="guide-icon">?</span>
+        <div>
+          <span>Don't have your Spotify data yet?</span>
+          <a
+            href="assets/Spotify Data Download Instructions.pdf"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            How to download your Spotify data
+            <span>↗</span>
+          </a>
+        </div>
+      </div>
+
+    </section>
+
+    <section class="privacy-card">
+
+      <div class="privacy-icon">
+        <svg
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.6"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          aria-hidden="true"
+        >
+          <path d="M12 22s8-4 8-11V5l-8-3-8 3v6c0 7 8 11 8 11Z"></path>
+          <path d="m9 12 2 2 4-4"></path>
+        </svg>
+      </div>
+
+      <div class="privacy-content">
+        <h3>Your data stays yours.</h3>
+
+        <p>
+          Your Spotify listening history is processed entirely in your
+          browser. Your file is never uploaded to our servers, and we do
+          not store, collect, or share your listening history.
+        </p>
+
+        <span class="privacy-note">
+          NO ACCOUNTS &nbsp;·&nbsp; NO DATABASE &nbsp;·&nbsp; NO DATA STORAGE
+        </span>
+      </div>
+
+    </section>
+
+    <footer class="site-footer">
+      <span>SPOTISTATS</span>
+    </footer>
+
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
