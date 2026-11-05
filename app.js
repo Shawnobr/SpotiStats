@@ -14,6 +14,9 @@
   const validationMessage = document.getElementById("validation-message");
   const validationText = document.getElementById("validation-text");
   const processButton = document.getElementById("process-button");
+  const privacyCard = document.querySelector(".privacy-card");
+  const privacyCardOriginalParent = privacyCard ? privacyCard.parentNode : null;
+  const privacyCardOriginalNextSibling = privacyCard ? privacyCard.nextSibling : null;
 
   const MAX_FILE_SIZE = 500 * 1024 * 1024;
   const MAX_JSON_FILES = 1000;
@@ -1209,12 +1212,14 @@
     dashboard.appendChild(privacy);
 
     const uploadSection = document.querySelector(".upload-section");
-    const privacyCard = document.querySelector(".privacy-card");
 
     if (uploadSection) uploadSection.hidden = true;
 
-    // Keep the existing privacy disclosure available.
-    if (privacyCard) privacyCard.hidden = false;
+    // Move the full privacy disclosure below the dashboard content.
+    if (privacyCard) {
+      privacyCard.hidden = false;
+      dashboard.appendChild(privacyCard);
+    }
 
     const pageShell = document.querySelector(".page-shell") || document.body;
     const footer = document.querySelector(".site-footer");
@@ -1801,13 +1806,26 @@
     const uploadSection = document.querySelector(".upload-section");
     if (uploadSection) uploadSection.hidden = false;
 
+    // Restore the privacy disclosure to its original upload-page position.
+    if (privacyCard && privacyCardOriginalParent) {
+      if (
+        privacyCardOriginalNextSibling &&
+        privacyCardOriginalNextSibling.parentNode === privacyCardOriginalParent
+      ) {
+        privacyCardOriginalParent.insertBefore(
+          privacyCard,
+          privacyCardOriginalNextSibling
+        );
+      } else {
+        privacyCardOriginalParent.appendChild(privacyCard);
+      }
+      privacyCard.hidden = false;
+    }
+
     dashboardRecords = [];
     selectedPeriod = "month";
 
     resetUpload();
-
-    const privacyCard = document.querySelector(".privacy-card");
-    if (privacyCard) privacyCard.hidden = false;
 
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
