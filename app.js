@@ -1,4 +1,3 @@
-
 (() => {
   "use strict";
 
@@ -27,6 +26,9 @@
   let selectedPeriod = "month";
   const artistImageCache = new Map();
   const artistImageRequests = new Map();
+  const THEAUDIODB_API_KEY = "123";
+  let artistMetadataQueue = Promise.resolve();
+  let lastArtistMetadataRequestAt = 0;
 
   // --------------------------------------------------
   // General helpers
@@ -1194,7 +1196,7 @@
       createElement(
         "p",
         "stats-disclaimer",
-        "Statistics are calculated locally from your Spotify Extended Streaming History. Artist and album artwork, genres, and other metadata have not been loaded yet."
+        "Statistics are calculated locally from your Spotify Extended Streaming History. Artist profile images and MusicBrainz artist IDs are matched through TheAudioDB when available. Artists without a reliable matching profile keep the default placeholder."
       )
     );
 
@@ -1369,8 +1371,67 @@
     return button;
   }
 
-  // Fetch a small artist portrait from Wikimedia Commons. Only the artist
-  // name is sent; listening records and statistics stay in this browser.
+  // TheAudioDB provides music-specific artist profiles and artwork.
+  // Only the artist name is sent; listening records and statistics stay local.
+  // Requests are serialized to stay below the free API's 30 requests/minute limit.
+  function fetchTheAudioDB(url) {
+    const request = artistMetadataQueue.then(async () => {
+      const minimumInterval = 2100;
+      const elapsed = Date.now() - lastArtistMetadataRequestAt;
+      const wait = Math.max(0, minimumInterval - elapsed);
+
+      if (wait > 0) {
+        await new Promise((resolve) => setTimeout(resolve, wait));
+      }
+
+      lastArtistMetadataRequestAt = Date.now();
+      const response = await fetch(url);
+
+      if (response.status === 429) {
+        throw new Error("TheAudioDB rate limit reached");
+      }
+
+      if (!response.ok) {
+        throw new Error(`TheAudioDB request failed (${response.status})`);
+      }
+
+      return response.json();
+    });
+
+    artistMetadataQueue = request.catch(() => null);
+    return request;
+  }
+
+  function normalizeArtistMatchName(value) {
+    return String(value || "")
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .toLocaleLowerCase()
+      .replace(/&/g, " and ")
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim()
+      .replace(/\s+/g, " ");
+  }
+
+  function getExactArtistMatch(artists, requestedName) {
+    const requested = normalizeArtistMatchName(requestedName);
+    if (!Array.isArray(artists) || !requested) return null;
+
+    return artists.find((artist) => {
+      const primaryName = normalizeArtistMatchName(artist.strArtist);
+      const strippedName = normalizeArtistMatchName(artist.strArtistStripped);
+      const alternateNames = String(artist.strArtistAlternate || "")
+        .split(/[;,|]/)
+        .map(normalizeArtistMatchName);
+
+      return (
+        primaryName === requested ||
+        strippedName === requested ||
+        alternateNames.includes(requested)
+      );
+    }) || null;
+  }
+
   async function loadArtistImage(artistName, avatar) {
     const key = normalize(artistName);
     if (!key || !avatar) return;
@@ -1382,7 +1443,7 @@
       img.className = "stats-artist-avatar";
       img.src = image.url;
       img.alt = `${artistName} profile`;
-      img.title = image.attribution || `Image from Wikimedia Commons`;
+      img.title = image.attribution || `${artistName} · TheAudioDB`;
       img.loading = "lazy";
       img.referrerPolicy = "no-referrer";
       img.addEventListener("error", () => {
@@ -1404,55 +1465,32 @@
 
     const request = (async () => {
       try {
-        const params = new URLSearchParams({
-          action: "query",
-          format: "json",
-          origin: "*",
-          generator: "search",
-          gsrnamespace: "6",
-          gsrsearch: `${artistName} musician portrait`,
-          gsrlimit: "8",
-          prop: "imageinfo",
-          iiprop: "url|extmetadata",
-          iiurlwidth: "96"
-        });
+        const url =
+          `https://www.theaudiodb.com/api/v1/json/${THEAUDIODB_API_KEY}/search.php?s=${encodeURIComponent(artistName)}`;
+        const data = await fetchTheAudioDB(url);
+        const artist = getExactArtistMatch(data?.artists, artistName);
 
-        const response = await fetch(
-          `https://commons.wikimedia.org/w/api.php?${params.toString()}`
-        );
-        if (!response.ok) return null;
+        if (!artist) return null;
 
-        const data = await response.json();
-        const pages = Object.values(data.query?.pages || {});
-        const candidates = pages
-          .map((page) => ({
-            title: page.title || "",
-            info: page.imageinfo?.[0]
-          }))
-          .filter(({ title, info }) =>
-            info?.thumburl && /\.(jpe?g|png|webp)$/i.test(title)
-          );
+        const imageUrl =
+          artist.strArtistThumb ||
+          artist.strArtistWideThumb ||
+          artist.strArtistFanart ||
+          artist.strArtistFanart2 ||
+          artist.strArtistFanart3 ||
+          artist.strArtistFanart4 ||
+          null;
 
-        if (!candidates.length) return null;
-
-        const preferred = candidates.find(({ title }) =>
-          /portrait|headshot|press|photo/i.test(title)
-        ) || candidates[0];
-        const metadata = preferred.info.extmetadata || {};
-        const credit = metadata.Artist?.value || metadata.Credit?.value || "";
-        const license = metadata.LicenseShortName?.value || "";
-        const attribution = [
-          credit.replace(/<[^>]*>/g, "").trim(),
-          license.replace(/<[^>]*>/g, "").trim(),
-          "Wikimedia Commons"
-        ].filter(Boolean).join(" · ");
+        if (!imageUrl || !/^https:\/\//i.test(imageUrl)) return null;
 
         return {
-          url: preferred.info.thumburl,
-          attribution: attribution || "Wikimedia Commons"
+          url: imageUrl,
+          artistName: artist.strArtist || artistName,
+          musicBrainzArtistId: artist.strMusicBrainzID || null,
+          attribution: `${artist.strArtist || artistName} · TheAudioDB`
         };
       } catch (error) {
-        console.warn(`Could not load an image for ${artistName}:`, error);
+        console.warn(`Could not load TheAudioDB profile for ${artistName}:`, error);
         return null;
       }
     })();
