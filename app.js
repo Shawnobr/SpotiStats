@@ -25,6 +25,8 @@
   let isValidated = false;
   let dashboardRecords = [];
   let selectedPeriod = "month";
+  const artistImageCache = new Map();
+  const artistImageRequests = new Map();
 
   // --------------------------------------------------
   // General helpers
@@ -649,6 +651,27 @@
       .stats-artist-button:hover {
         border-color: #d5fb62;
         background: #22262a;
+      }
+
+      .stats-artist-identity {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        min-width: 0;
+      }
+
+      .stats-artist-avatar {
+        width: 38px;
+        height: 38px;
+        flex: 0 0 38px;
+        display: grid;
+        place-items: center;
+        overflow: hidden;
+        border-radius: 50%;
+        background: #30343a;
+        color: #d5fb62;
+        font: 12px "DM Mono", monospace;
+        object-fit: cover;
       }
 
       .stats-artist-name {
@@ -1310,28 +1333,135 @@
     }
 
     matchingArtists.slice(0, 15).forEach((artist) => {
-      container.appendChild(createArtistButton(artist));
+      container.appendChild(createArtistButton(artist, true));
     });
   }
 
-  function createArtistButton(artist) {
+  function createArtistButton(artist, showImage = false) {
     const button = createElement("button", "stats-artist-button");
     button.type = "button";
 
+    const identity = createElement("span", "stats-artist-identity");
+
+    if (showImage) {
+      const avatar = createElement("span", "stats-artist-avatar");
+      avatar.textContent = "♪";
+      avatar.setAttribute("aria-hidden", "true");
+      identity.appendChild(avatar);
+      loadArtistImage(artist.name, avatar);
+    }
+
     const name = createElement("span", "stats-artist-name", artist.name);
+    identity.appendChild(name);
+
     const plays = createElement(
       "span",
       "stats-artist-plays",
       `${formatNumber(artist.plays)} plays`
     );
 
-    button.append(name, plays);
+    button.append(identity, plays);
 
     button.addEventListener("click", () => {
       openArtistModal(artist.name);
     });
 
     return button;
+  }
+
+  // Fetch a small artist portrait from Wikimedia Commons. Only the artist
+  // name is sent; listening records and statistics stay in this browser.
+  async function loadArtistImage(artistName, avatar) {
+    const key = normalize(artistName);
+    if (!key || !avatar) return;
+
+    const applyImage = (image) => {
+      if (!image || !avatar.isConnected) return;
+
+      const img = document.createElement("img");
+      img.className = "stats-artist-avatar";
+      img.src = image.url;
+      img.alt = `${artistName} profile`;
+      img.title = image.attribution || `Image from Wikimedia Commons`;
+      img.loading = "lazy";
+      img.referrerPolicy = "no-referrer";
+      img.addEventListener("error", () => {
+        img.replaceWith(avatar);
+      }, { once: true });
+      avatar.replaceWith(img);
+    };
+
+    if (artistImageCache.has(key)) {
+      applyImage(artistImageCache.get(key));
+      return;
+    }
+
+    if (artistImageRequests.has(key)) {
+      const image = await artistImageRequests.get(key);
+      applyImage(image);
+      return;
+    }
+
+    const request = (async () => {
+      try {
+        const params = new URLSearchParams({
+          action: "query",
+          format: "json",
+          origin: "*",
+          generator: "search",
+          gsrnamespace: "6",
+          gsrsearch: `${artistName} musician portrait`,
+          gsrlimit: "8",
+          prop: "imageinfo",
+          iiprop: "url|extmetadata",
+          iiurlwidth: "96"
+        });
+
+        const response = await fetch(
+          `https://commons.wikimedia.org/w/api.php?${params.toString()}`
+        );
+        if (!response.ok) return null;
+
+        const data = await response.json();
+        const pages = Object.values(data.query?.pages || {});
+        const candidates = pages
+          .map((page) => ({
+            title: page.title || "",
+            info: page.imageinfo?.[0]
+          }))
+          .filter(({ title, info }) =>
+            info?.thumburl && /\.(jpe?g|png|webp)$/i.test(title)
+          );
+
+        if (!candidates.length) return null;
+
+        const preferred = candidates.find(({ title }) =>
+          /portrait|headshot|press|photo/i.test(title)
+        ) || candidates[0];
+        const metadata = preferred.info.extmetadata || {};
+        const credit = metadata.Artist?.value || metadata.Credit?.value || "";
+        const license = metadata.LicenseShortName?.value || "";
+        const attribution = [
+          credit.replace(/<[^>]*>/g, "").trim(),
+          license.replace(/<[^>]*>/g, "").trim(),
+          "Wikimedia Commons"
+        ].filter(Boolean).join(" · ");
+
+        return {
+          url: preferred.info.thumburl,
+          attribution: attribution || "Wikimedia Commons"
+        };
+      } catch (error) {
+        console.warn(`Could not load an image for ${artistName}:`, error);
+        return null;
+      }
+    })();
+
+    artistImageRequests.set(key, request);
+    const image = await request;
+    artistImageCache.set(key, image);
+    artistImageRequests.delete(key);
+    applyImage(image);
   }
 
   function renderTopArtists(artists) {
