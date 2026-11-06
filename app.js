@@ -1,3 +1,4 @@
+
 (() => {
   "use strict";
 
@@ -21,17 +22,28 @@
   const MAX_FILE_SIZE = 500 * 1024 * 1024;
   const MAX_JSON_FILES = 1000;
 
+  const METADATA_API_URL =
+    "https://spotistats-metadata.shawnfinkle6.workers.dev";
+
+  const METADATA_BATCH_SIZE = 10;
+
   let currentFile = null;
   let validatedRecords = [];
   let validationRun = 0;
   let isValidated = false;
   let dashboardRecords = [];
   let selectedPeriod = "month";
+
+  // Full metadata records are kept in memory for future features.
+  const artistMetadataCache = new Map();
+  const artistMetadataRequests = new Map();
+
+  // Image cache is separate so images can be reused without re-fetching metadata.
   const artistImageCache = new Map();
-  const artistImageRequests = new Map();
-  const THEAUDIODB_API_KEY = "123";
-  let artistMetadataQueue = Promise.resolve();
-  let lastArtistMetadataRequestAt = 0;
+
+  let metadataLoading = false;
+  let metadataLoadedCount = 0;
+  let metadataTotalCount = 0;
 
   // --------------------------------------------------
   // General helpers
@@ -50,6 +62,17 @@
     return String(value || "")
       .trim()
       .toLocaleLowerCase()
+      .replace(/\s+/g, " ");
+  }
+
+  function normalizeArtistKey(value) {
+    return String(value || "")
+      .normalize("NFKD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .toLocaleLowerCase()
+      .replace(/&/g, " and ")
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim()
       .replace(/\s+/g, " ");
   }
 
@@ -773,6 +796,12 @@
         margin-top: 28px;
       }
 
+      .stats-metadata-status {
+        color: #858990;
+        font: 10px "DM Mono", monospace;
+        margin-top: 8px;
+      }
+
       .stats-modal {
         position: fixed;
         inset: 0;
@@ -1045,6 +1074,300 @@
   }
 
   // --------------------------------------------------
+  // Cloudflare artist metadata service
+  // --------------------------------------------------
+
+  function getUniqueArtistNames() {
+    const unique = new Map();
+
+    dashboardRecords.forEach((record) => {
+      const name = record.artistName.trim();
+      const key = normalizeArtistKey(name);
+
+      if (key && !unique.has(key)) {
+        unique.set(key, name);
+      }
+    });
+
+    return [...unique.values()];
+  }
+
+  function getArtistMetadata(artistName) {
+    const key = normalizeArtistKey(artistName);
+    return artistMetadataCache.get(key) || null;
+  }
+
+  function getArtistImageUrl(metadata) {
+    const images = metadata?.images;
+
+    if (!images) return null;
+
+    const candidates = [
+      images.artistSmallThumb,
+      images.artistThumb,
+      images.artistMediumThumb,
+      images.artistWideThumb,
+      images.artistFanart,
+      images.artistFanart2,
+      images.artistFanart3,
+      images.artistFanart4
+    ];
+
+    return candidates.find(
+      (url) => typeof url === "string" && /^https:\/\//i.test(url)
+    ) || null;
+  }
+
+  function storeArtistMetadata(metadata) {
+    if (!metadata || typeof metadata !== "object") return;
+
+    const requestedName = metadata.requestedName;
+    const canonicalName = metadata.identity?.name;
+
+    const names = [requestedName, canonicalName].filter(Boolean);
+
+    names.forEach((name) => {
+      const key = normalizeArtistKey(name);
+      if (key) artistMetadataCache.set(key, metadata);
+    });
+
+    names.forEach((name) => {
+      const key = normalizeArtistKey(name);
+      const imageUrl = getArtistImageUrl(metadata);
+
+      if (key && imageUrl) {
+        artistImageCache.set(key, {
+          url: imageUrl,
+          artistName: canonicalName || name,
+          musicBrainzArtistId:
+            metadata.identity?.musicBrainzId || null,
+          attribution: `${canonicalName || name} · TheAudioDB`
+        });
+      }
+    });
+  }
+
+  async function fetchArtistMetadataBatch(names) {
+    const response = await fetch(`${METADATA_API_URL}/api/artists`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ names })
+    });
+
+    let data;
+
+    try {
+      data = await response.json();
+    } catch {
+      throw new Error("The metadata service returned an unreadable response.");
+    }
+
+    if (!response.ok) {
+      throw new Error(
+        data.error || `Metadata service returned HTTP ${response.status}.`
+      );
+    }
+
+    if (!Array.isArray(data.results)) {
+      throw new Error("The metadata service returned an unexpected response.");
+    }
+
+    return data;
+  }
+
+  function updateMetadataStatus(message) {
+    const status = document.getElementById("stats-metadata-status");
+
+    if (status) {
+      status.textContent = message;
+    }
+  }
+
+  async function loadAllArtistMetadata() {
+    if (metadataLoading) return;
+
+    const names = getUniqueArtistNames();
+
+    metadataTotalCount = names.length;
+    metadataLoadedCount = 0;
+
+    if (names.length === 0) {
+      updateMetadataStatus("No artist metadata to load.");
+      return;
+    }
+
+    const uncachedNames = names.filter(
+      (name) => !getArtistMetadata(name)
+    );
+
+    if (uncachedNames.length === 0) {
+      metadataLoadedCount = names.length;
+      updateMetadataStatus(
+        `Artist metadata ready · ${formatNumber(names.length)} artists`
+      );
+      refreshArtistImages();
+      return;
+    }
+
+    metadataLoading = true;
+
+    updateMetadataStatus(
+      `Loading artist metadata · 0 of ${formatNumber(names.length)}`
+    );
+
+    try {
+      for (
+        let start = 0;
+        start < uncachedNames.length;
+        start += METADATA_BATCH_SIZE
+      ) {
+        const batch = uncachedNames.slice(
+          start,
+          start + METADATA_BATCH_SIZE
+        );
+
+        // Avoid requesting the same artist more than once in this session.
+        const requestNames = batch.filter((name) => {
+          const key = normalizeArtistKey(name);
+          return !artistMetadataRequests.has(key);
+        });
+
+        if (requestNames.length > 0) {
+          requestNames.forEach((name) => {
+            const key = normalizeArtistKey(name);
+            artistMetadataRequests.set(key, true);
+          });
+
+          try {
+            const data = await fetchArtistMetadataBatch(requestNames);
+
+            data.results.forEach((result) => {
+              if (result.artist) {
+                storeArtistMetadata(result.artist);
+              } else {
+                console.warn(
+                  `No metadata found for ${result.requestedName}:`,
+                  result.error || "No provider match."
+                );
+              }
+            });
+          } finally {
+            requestNames.forEach((name) => {
+              artistMetadataRequests.delete(normalizeArtistKey(name));
+            });
+          }
+        }
+
+        metadataLoadedCount = Math.min(
+          names.length,
+          metadataLoadedCount + batch.length
+        );
+
+        updateMetadataStatus(
+          `Loading artist metadata · ${formatNumber(metadataLoadedCount)} of ${formatNumber(names.length)}`
+        );
+
+        refreshArtistImages();
+      }
+
+      const foundCount = names.filter(
+        (name) => getArtistMetadata(name)
+      ).length;
+
+      updateMetadataStatus(
+        `Artist metadata ready · ${formatNumber(foundCount)} of ${formatNumber(names.length)} artists matched`
+      );
+
+      refreshArtistImages();
+
+    } catch (error) {
+      console.error("Artist metadata loading failed:", error);
+
+      updateMetadataStatus(
+        "Artist metadata could not finish loading. Reload the page to try again."
+      );
+    } finally {
+      metadataLoading = false;
+    }
+  }
+
+  // --------------------------------------------------
+  // Artist images
+  // --------------------------------------------------
+
+  function applyArtistImage(artistName, avatar) {
+    if (!avatar || !avatar.isConnected) return;
+
+    const key = normalizeArtistKey(artistName);
+    const image = artistImageCache.get(key);
+
+    if (!image) return;
+
+    const img = document.createElement("img");
+    img.className = "stats-artist-avatar";
+    img.src = image.url;
+    img.alt = `${image.artistName || artistName} profile`;
+    img.title = image.attribution || artistName;
+    img.loading = "lazy";
+    img.referrerPolicy = "no-referrer";
+
+    img.addEventListener("error", () => {
+      img.replaceWith(avatar);
+    }, { once: true });
+
+    avatar.replaceWith(img);
+  }
+
+  function loadArtistImage(artistName, avatar) {
+    if (!avatar) return;
+
+    const key = normalizeArtistKey(artistName);
+    if (!key) return;
+
+    // Metadata and image cache are already populated in memory.
+    if (artistImageCache.has(key)) {
+      applyArtistImage(artistName, avatar);
+      return;
+    }
+
+    // If metadata is available but there is no image, don't make another request.
+    const metadata = getArtistMetadata(artistName);
+
+    if (metadata) {
+      const imageUrl = getArtistImageUrl(metadata);
+
+      if (!imageUrl) return;
+
+      const image = {
+        url: imageUrl,
+        artistName: metadata.identity?.name || artistName,
+        musicBrainzArtistId: metadata.identity?.musicBrainzId || null,
+        attribution: `${metadata.identity?.name || artistName} · TheAudioDB`
+      };
+
+      artistImageCache.set(key, image);
+      applyArtistImage(artistName, avatar);
+    }
+  }
+
+  function refreshArtistImages() {
+    const search = document.getElementById("stats-artist-search");
+
+    if (search) {
+      renderArtistList();
+    }
+
+    const topArtists = document.getElementById("stats-top-artists");
+
+    if (topArtists) {
+      const stats = calculateStatistics(getFilteredRecords());
+      renderTopArtists(stats.artists);
+    }
+  }
+
+  // --------------------------------------------------
   // Dashboard construction
   // --------------------------------------------------
 
@@ -1199,14 +1522,22 @@
       createElement(
         "p",
         "stats-disclaimer",
-        "Statistics are calculated locally from your Spotify Extended Streaming History. Artist profile images and MusicBrainz artist IDs are matched through TheAudioDB when available. Artists without a reliable matching profile keep the default placeholder."
+        "Statistics are calculated locally from your Spotify Extended Streaming History. Artist metadata and profile images are retrieved through SpotiStats Metadata API when available."
       )
     );
+
+    const metadataStatus = createElement(
+      "div",
+      "stats-metadata-status",
+      "Preparing artist metadata..."
+    );
+    metadataStatus.id = "stats-metadata-status";
+    dashboard.appendChild(metadataStatus);
 
     const privacy = createElement(
       "p",
       "stats-disclaimer",
-      "Your listening history remains in this browser session. No listening records are uploaded or permanently stored."
+      "Your listening history remains in this browser session. No listening records are uploaded or permanently stored. Only artist names are sent to the metadata service to retrieve artist information."
     );
 
     dashboard.appendChild(privacy);
@@ -1232,6 +1563,9 @@
 
     createArtistModal();
     renderDashboard();
+
+    // Start metadata retrieval in the background after the dashboard is ready.
+    loadAllArtistMetadata();
   }
 
   // --------------------------------------------------
@@ -1376,137 +1710,6 @@
     return button;
   }
 
-  // TheAudioDB provides music-specific artist profiles and artwork.
-  // Only the artist name is sent; listening records and statistics stay local.
-  // Requests are serialized to stay below the free API's 30 requests/minute limit.
-  function fetchTheAudioDB(url) {
-    const request = artistMetadataQueue.then(async () => {
-      const minimumInterval = 2100;
-      const elapsed = Date.now() - lastArtistMetadataRequestAt;
-      const wait = Math.max(0, minimumInterval - elapsed);
-
-      if (wait > 0) {
-        await new Promise((resolve) => setTimeout(resolve, wait));
-      }
-
-      lastArtistMetadataRequestAt = Date.now();
-      const response = await fetch(url);
-
-      if (response.status === 429) {
-        throw new Error("TheAudioDB rate limit reached");
-      }
-
-      if (!response.ok) {
-        throw new Error(`TheAudioDB request failed (${response.status})`);
-      }
-
-      return response.json();
-    });
-
-    artistMetadataQueue = request.catch(() => null);
-    return request;
-  }
-
-  function normalizeArtistMatchName(value) {
-    return String(value || "")
-      .normalize("NFD")
-      .replace(/[\u0300-\u036f]/g, "")
-      .toLocaleLowerCase()
-      .replace(/&/g, " and ")
-      .replace(/[^a-z0-9]+/g, " ")
-      .trim()
-      .replace(/\s+/g, " ");
-  }
-
-  function getExactArtistMatch(artists, requestedName) {
-    const requested = normalizeArtistMatchName(requestedName);
-    if (!Array.isArray(artists) || !requested) return null;
-
-    return artists.find((artist) => {
-      const primaryName = normalizeArtistMatchName(artist.strArtist);
-      const strippedName = normalizeArtistMatchName(artist.strArtistStripped);
-      const alternateNames = String(artist.strArtistAlternate || "")
-        .split(/[;,|]/)
-        .map(normalizeArtistMatchName);
-
-      return (
-        primaryName === requested ||
-        strippedName === requested ||
-        alternateNames.includes(requested)
-      );
-    }) || null;
-  }
-
-  async function loadArtistImage(artistName, avatar) {
-    const key = normalize(artistName);
-    if (!key || !avatar) return;
-
-    const applyImage = (image) => {
-      if (!image || !avatar.isConnected) return;
-
-      const img = document.createElement("img");
-      img.className = "stats-artist-avatar";
-      img.src = image.url;
-      img.alt = `${artistName} profile`;
-      img.title = image.attribution || `${artistName} · TheAudioDB`;
-      img.loading = "lazy";
-      img.referrerPolicy = "no-referrer";
-      img.addEventListener("error", () => {
-        img.replaceWith(avatar);
-      }, { once: true });
-      avatar.replaceWith(img);
-    };
-
-    if (artistImageCache.has(key)) {
-      applyImage(artistImageCache.get(key));
-      return;
-    }
-
-    if (artistImageRequests.has(key)) {
-      const image = await artistImageRequests.get(key);
-      applyImage(image);
-      return;
-    }
-
-    const request = (async () => {
-      try {
-        const url =
-          `https://www.theaudiodb.com/api/v1/json/${THEAUDIODB_API_KEY}/search.php?s=${encodeURIComponent(artistName)}`;
-        const data = await fetchTheAudioDB(url);
-        const artist = getExactArtistMatch(data?.artists, artistName);
-
-        if (!artist) return null;
-
-        const imageUrl =
-          artist.strArtistThumb ||
-          artist.strArtistWideThumb ||
-          artist.strArtistFanart ||
-          artist.strArtistFanart2 ||
-          artist.strArtistFanart3 ||
-          artist.strArtistFanart4 ||
-          null;
-
-        if (!imageUrl || !/^https:\/\//i.test(imageUrl)) return null;
-
-        return {
-          url: imageUrl,
-          artistName: artist.strArtist || artistName,
-          musicBrainzArtistId: artist.strMusicBrainzID || null,
-          attribution: `${artist.strArtist || artistName} · TheAudioDB`
-        };
-      } catch (error) {
-        console.warn(`Could not load TheAudioDB profile for ${artistName}:`, error);
-        return null;
-      }
-    })();
-
-    artistImageRequests.set(key, request);
-    const image = await request;
-    artistImageCache.set(key, image);
-    artistImageRequests.delete(key);
-    applyImage(image);
-  }
-
   function renderTopArtists(artists) {
     const container = document.getElementById("stats-top-artists");
     if (!container) return;
@@ -1521,7 +1724,7 @@
     }
 
     artists.slice(0, 10).forEach((artist) => {
-      container.appendChild(createArtistButton(artist));
+      container.appendChild(createArtistButton(artist, true));
     });
   }
 
@@ -1788,6 +1991,15 @@
     dashboardRecords = validatedRecords.slice();
     selectedPeriod = "month";
 
+    // Reset metadata state for the newly imported listening history.
+    artistMetadataCache.clear();
+    artistImageCache.clear();
+    artistMetadataRequests.clear();
+
+    metadataLoading = false;
+    metadataLoadedCount = 0;
+    metadataTotalCount = 0;
+
     createDashboard();
 
     // Release the original upload references after creating the dashboard.
@@ -1824,6 +2036,14 @@
 
     dashboardRecords = [];
     selectedPeriod = "month";
+
+    artistMetadataCache.clear();
+    artistImageCache.clear();
+    artistMetadataRequests.clear();
+
+    metadataLoading = false;
+    metadataLoadedCount = 0;
+    metadataTotalCount = 0;
 
     resetUpload();
 
