@@ -49,8 +49,11 @@
 
   let metadataLoading = false;
   let albumCoverLoading = false;
+  let artistImageLoading = false;
+
   let metadataLoadedCount = 0;
   let metadataTotalCount = 0;
+  let artistImagesLoadedCount = 0;
 
   // --------------------------------------------------
   // General helpers
@@ -701,7 +704,9 @@
   async function loadAllArtistMetadata() {
     if (metadataLoading) return;
 
-    const names = getUniqueArtistNames();
+    // getAllTimeArtists() is already sorted by play count.
+    // This means the most-listened-to artists are processed first.
+    const names = getAllTimeArtists().map((artist) => artist.name);
 
     metadataTotalCount = names.length;
     metadataLoadedCount = 0;
@@ -723,6 +728,7 @@
       );
 
       refreshArtistImages();
+      await loadAllArtistImages();
       return;
     }
 
@@ -802,6 +808,12 @@
       );
 
       refreshArtistImages();
+
+      await loadAllArtistImages();
+
+      updateMetadataStatus(
+        `Artist images loaded · ${formatNumber(artistImagesLoadedCount)} of ${formatNumber(names.length)} artists`
+      );
 
     } catch (error) {
       console.error("Artist metadata loading failed:", error);
@@ -979,7 +991,7 @@
   }
 
   // --------------------------------------------------
-  // Artist image rendering and refresh
+  // Artist image rendering and background preloading
   // --------------------------------------------------
 
   function getArtistImageUrl(name) {
@@ -1023,47 +1035,87 @@
   async function loadArtistImageForArtist(name) {
     const metadata = getArtistMetadata(name);
 
-    if (!metadata) return;
+    if (!metadata) return false;
 
     const imageUrl = getArtistImageUrl(name);
 
-    if (!imageUrl) return;
+    if (!imageUrl) return false;
 
     const key = normalizeArtistKey(name);
 
     artistImageCache.set(key, imageUrl);
 
-    const image = document.querySelector(
-      `[data-artist-image="${CSS.escape(name)}"]`
-    );
+    // Preload the image even when the artist is not currently visible.
+    // This also allows the browser to reuse the downloaded image later.
+    return new Promise((resolve) => {
+      const preload = new Image();
 
-    if (image) {
-      image.src = imageUrl;
-      image.hidden = false;
-
-      const placeholder =
-        image.parentElement?.querySelector(
-          ".stats-artist-image-placeholder"
+      preload.onload = () => {
+        const image = document.querySelector(
+          `[data-artist-image="${CSS.escape(name)}"]`
         );
 
-      if (placeholder) placeholder.hidden = true;
-    }
+        if (image) {
+          image.src = imageUrl;
+          image.hidden = false;
+
+          const placeholder =
+            image.parentElement?.querySelector(
+              ".stats-artist-image-placeholder"
+            );
+
+          if (placeholder) placeholder.hidden = true;
+        }
+
+        resolve(true);
+      };
+
+      preload.onerror = () => {
+        console.warn(`Artist image unavailable for ${name}`);
+        resolve(false);
+      };
+
+      preload.src = imageUrl;
+    });
   }
 
   async function loadAllArtistImages() {
+    if (artistImageLoading) return;
+
     const artists = getAllTimeArtists();
 
     if (!artists.length) return;
 
+    artistImageLoading = true;
+    artistImagesLoadedCount = 0;
+
+    // Artists are sorted by all-time plays, highest first.
     const prioritized = artists.slice(0, 10);
     const remaining = artists.slice(10);
 
-    for (const artist of prioritized) {
-      await loadArtistImageForArtist(artist.name);
-    }
+    const loadGroup = async (group) => {
+      for (const artist of group) {
+        const loaded = await loadArtistImageForArtist(artist.name);
 
-    for (const artist of remaining) {
-      await loadArtistImageForArtist(artist.name);
+        if (loaded) {
+          artistImagesLoadedCount++;
+        }
+
+        updateMetadataStatus(
+          `Loading artist images · ${formatNumber(artistImagesLoadedCount)} loaded · ${formatNumber(artists.length)} artists`
+        );
+      }
+    };
+
+    try {
+      // Load the ten most-listened-to artists first.
+      await loadGroup(prioritized);
+
+      // Then load all remaining artists sequentially.
+      await loadGroup(remaining);
+
+    } finally {
+      artistImageLoading = false;
     }
   }
 
@@ -2429,9 +2481,11 @@
 
     metadataLoading = false;
     albumCoverLoading = false;
+    artistImageLoading = false;
 
     metadataLoadedCount = 0;
     metadataTotalCount = 0;
+    artistImagesLoadedCount = 0;
 
     try {
       createDashboard();
@@ -2490,9 +2544,11 @@
 
     metadataLoading = false;
     albumCoverLoading = false;
+    artistImageLoading = false;
 
     metadataLoadedCount = 0;
     metadataTotalCount = 0;
+    artistImagesLoadedCount = 0;
 
     resetUpload();
 
