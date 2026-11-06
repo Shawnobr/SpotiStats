@@ -16,8 +16,14 @@
   const validationText = document.getElementById("validation-text");
   const processButton = document.getElementById("process-button");
   const privacyCard = document.querySelector(".privacy-card");
-  const privacyCardOriginalParent = privacyCard ? privacyCard.parentNode : null;
-  const privacyCardOriginalNextSibling = privacyCard ? privacyCard.nextSibling : null;
+
+  const privacyCardOriginalParent = privacyCard
+    ? privacyCard.parentNode
+    : null;
+
+  const privacyCardOriginalNextSibling = privacyCard
+    ? privacyCard.nextSibling
+    : null;
 
   const MAX_FILE_SIZE = 500 * 1024 * 1024;
   const MAX_JSON_FILES = 1000;
@@ -34,14 +40,10 @@
   let dashboardRecords = [];
   let selectedPeriod = "all";
 
-  // Full metadata records are kept in memory for future features.
   const artistMetadataCache = new Map();
   const artistMetadataRequests = new Map();
-
-  // Image cache is separate so images can be reused without re-fetching metadata.
   const artistImageCache = new Map();
 
-  // Album artwork is resolved from Spotify track links and cached for this session.
   const albumCoverCache = new Map();
   const albumCoverRequests = new Map();
 
@@ -57,9 +59,11 @@
   function formatFileSize(bytes) {
     if (bytes < 1024) return `${bytes} B`;
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+
     if (bytes < 1024 * 1024 * 1024) {
       return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
     }
+
     return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
   }
 
@@ -91,6 +95,7 @@
     const remainingMinutes = minutes % 60;
 
     if (hours === 0) return `${minutes} min`;
+
     return `${hours.toLocaleString()} hr ${remainingMinutes} min`;
   }
 
@@ -122,7 +127,7 @@
   }
 
   // --------------------------------------------------
-  // Upload messages
+  // Upload messages and button state
   // --------------------------------------------------
 
   function showMessage(message, type = "error") {
@@ -156,8 +161,10 @@
     validationMessage.style.color = "";
   }
 
-  function setState(enabled) {
-    if (process) process.disabled = !enabled;
+  function setButtonState(enabled) {
+    if (processButton) {
+      processButton.disabled = !enabled;
+    }
   }
 
   // --------------------------------------------------
@@ -185,10 +192,11 @@
     if (fileSize) fileSize.textContent = "";
 
     hideMessage();
-    setState(false);
+    setButtonState(false);
 
-    if (process) {
-      process.innerHTML = 'Process listening history <span>→</span>';
+    if (processButton) {
+      processButton.innerHTML =
+        'Process listening history <span>→</span>';
     }
   }
 
@@ -206,25 +214,31 @@
 
     if (!file.name.toLowerCase().endsWith(".zip")) {
       currentFile = null;
+
       showMessage(
         "This file is not a ZIP archive. Please select your Spotify Extended Streaming History ZIP file."
       );
+
       return;
     }
 
     if (file.size === 0) {
       currentFile = null;
+
       showMessage(
         "This file is empty. Please download your Spotify data again and try another file."
       );
+
       return;
     }
 
     if (file.size > MAX_FILE_SIZE) {
       currentFile = null;
+
       showMessage(
         "This file is larger than the 500 MB limit. Please check your Spotify export and try another file."
       );
+
       return;
     }
 
@@ -250,6 +264,7 @@
       dropZone.addEventListener(eventName, (event) => {
         event.preventDefault();
         event.stopPropagation();
+
         dropZone.classList.add("drag-over");
       });
     });
@@ -258,12 +273,14 @@
       dropZone.addEventListener(eventName, (event) => {
         event.preventDefault();
         event.stopPropagation();
+
         dropZone.classList.remove("drag-over");
       });
     });
 
     dropZone.addEventListener("drop", (event) => {
       const file = event.dataTransfer.files[0];
+
       if (file) handleFileSelection(file);
     });
   }
@@ -338,6 +355,7 @@
 
     isValidated = false;
     validatedRecords = [];
+
     setButtonState(false);
 
     showMessage("Checking your ZIP file...", "info");
@@ -354,7 +372,8 @@
       if (thisRun !== validationRun) return;
 
       const jsonFiles = Object.values(zip.files).filter(
-        (entry) => !entry.dir && isSpotifyHistoryFilename(entry.name)
+        (entry) =>
+          !entry.dir && isSpotifyHistoryFilename(entry.name)
       );
 
       if (jsonFiles.length === 0) {
@@ -400,7 +419,10 @@
           if (normalized) records.push(normalized);
         });
 
-        if ((index + 1) % 10 === 0 || index === jsonFiles.length - 1) {
+        if (
+          (index + 1) % 10 === 0 ||
+          index === jsonFiles.length - 1
+        ) {
           showMessage(
             `Reading listening history... ${formatNumber(index + 1)} of ${formatNumber(jsonFiles.length)} files`,
             "info"
@@ -435,6 +457,7 @@
 
       validatedRecords = [];
       isValidated = false;
+
       setButtonState(false);
 
       showMessage(
@@ -459,7 +482,9 @@
       }
     });
 
-    return [...names.values()].sort((a, b) => a.localeCompare(b));
+    return [...names.values()].sort(
+      (a, b) => a.localeCompare(b)
+    );
   }
 
   function getUniqueAlbumNames() {
@@ -521,6 +546,7 @@
       }
 
       const artist = artists.get(artistKey);
+
       artist.plays++;
       artist.duration += record.duration;
 
@@ -555,13 +581,19 @@
             name: record.albumName,
             artistName: record.artistName,
             plays: 0,
-            duration: 0
+            duration: 0,
+            trackUri: record.spotifyTrackUri || null
           });
         }
 
         const album = albums.get(albumKey);
+
         album.plays++;
         album.duration += record.duration;
+
+        if (!album.trackUri && record.spotifyTrackUri) {
+          album.trackUri = record.spotifyTrackUri;
+        }
 
         if (!artist.albums.has(normalize(record.albumName))) {
           artist.albums.set(normalize(record.albumName), {
@@ -579,9 +611,15 @@
       totalDuration,
       uniqueSongs: tracks.size,
       uniqueArtists: artists.size,
-      artists: [...artists.values()].sort((a, b) => b.plays - a.plays),
-      albums: [...albums.values()].sort((a, b) => b.plays - a.plays),
-      tracks: [...tracks.values()].sort((a, b) => b.plays - a.plays)
+      artists: [...artists.values()].sort(
+        (a, b) => b.plays - a.plays
+      ),
+      albums: [...albums.values()].sort(
+        (a, b) => b.plays - a.plays
+      ),
+      tracks: [...tracks.values()].sort(
+        (a, b) => b.plays - a.plays
+      )
     };
   }
 
@@ -590,6 +628,7 @@
 
     records.forEach((record) => {
       const date = record.date;
+
       const key =
         `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
 
@@ -612,8 +651,8 @@
   function storeArtistMetadata(record) {
     if (!record) return;
 
-    const requestedName = record.requestedName ||
-      record.identity?.name;
+    const requestedName =
+      record.requestedName || record.identity?.name;
 
     if (!requestedName) return;
 
@@ -678,9 +717,11 @@
 
     if (uncachedNames.length === 0) {
       metadataLoadedCount = names.length;
+
       updateMetadataStatus(
         `Artist metadata ready · ${formatNumber(names.length)} artists`
       );
+
       refreshArtistImages();
       return;
     }
@@ -702,22 +743,25 @@
           start + METADATA_BATCH_SIZE
         );
 
-        // Avoid requesting the same artist more than once in this session.
         const requestNames = batch.filter((name) => {
           const key = normalizeArtistKey(name);
+
           return !artistMetadataRequests.has(key);
         });
 
         if (requestNames.length > 0) {
           requestNames.forEach((name) => {
-            const key = normalizeArtistKey(name);
-            artistMetadataRequests.set(key, true);
+            artistMetadataRequests.set(
+              normalizeArtistKey(name),
+              true
+            );
           });
 
           try {
-            const data = await fetchArtistMetadataBatch(requestNames);
+            const data =
+              await fetchArtistMetadataBatch(requestNames);
 
-            data.results.forEach((result) => {
+            (data.results || []).forEach((result) => {
               if (result.artist) {
                 storeArtistMetadata(result.artist);
               } else {
@@ -727,9 +771,12 @@
                 );
               }
             });
+
           } finally {
             requestNames.forEach((name) => {
-              artistMetadataRequests.delete(normalizeArtistKey(name));
+              artistMetadataRequests.delete(
+                normalizeArtistKey(name)
+              );
             });
           }
         }
@@ -762,6 +809,7 @@
       updateMetadataStatus(
         "Artist metadata could not finish loading. Reload the page to try again."
       );
+
     } finally {
       metadataLoading = false;
     }
@@ -784,6 +832,7 @@
 
     if (/^spotify:track:[A-Za-z0-9]+$/.test(uri)) {
       const id = uri.split(":").pop();
+
       return `https://open.spotify.com/track/${id}`;
     }
 
@@ -797,6 +846,7 @@
       ) {
         return `https://open.spotify.com${parsed.pathname}`;
       }
+
     } catch {
       return null;
     }
@@ -806,6 +856,7 @@
 
   async function fetchAlbumCover(trackUri) {
     const trackUrl = getSpotifyTrackUrl(trackUri);
+
     if (!trackUrl) return null;
 
     const response = await fetch(`${METADATA_API_URL}/api/album-cover`, {
@@ -853,7 +904,11 @@
         return imageUrl;
       })
       .catch((error) => {
-        console.warn(`Album artwork unavailable for ${album.name}:`, error);
+        console.warn(
+          `Album artwork unavailable for ${album.name}:`,
+          error
+        );
+
         albumCoverCache.set(key, null);
         return null;
       })
@@ -868,6 +923,7 @@
 
   function getAllTimeAlbums() {
     const stats = calculateStatistics(dashboardRecords);
+
     return stats.albums;
   }
 
@@ -877,6 +933,7 @@
     if (!imageUrl) return;
 
     const key = getAlbumKey(album);
+
     const image = document.querySelector(
       `[data-album-key="${CSS.escape(key)}"]`
     );
@@ -885,9 +942,10 @@
       image.src = imageUrl;
       image.hidden = false;
 
-      const placeholder = image.parentElement?.querySelector(
-        ".stats-album-cover-placeholder"
-      );
+      const placeholder =
+        image.parentElement?.querySelector(
+          ".stats-album-cover-placeholder"
+        );
 
       if (placeholder) placeholder.hidden = true;
     }
@@ -947,9 +1005,10 @@
       image.src = imageUrl;
       image.hidden = false;
 
-      const placeholder = image.parentElement?.querySelector(
-        ".stats-artist-image-placeholder"
-      );
+      const placeholder =
+        image.parentElement?.querySelector(
+          ".stats-artist-image-placeholder"
+        );
 
       if (placeholder) placeholder.hidden = true;
     });
@@ -957,6 +1016,7 @@
 
   function getAllTimeArtists() {
     const stats = calculateStatistics(dashboardRecords);
+
     return stats.artists;
   }
 
@@ -981,9 +1041,10 @@
       image.src = imageUrl;
       image.hidden = false;
 
-      const placeholder = image.parentElement?.querySelector(
-        ".stats-artist-image-placeholder"
-      );
+      const placeholder =
+        image.parentElement?.querySelector(
+          ".stats-artist-image-placeholder"
+        );
 
       if (placeholder) placeholder.hidden = true;
     }
@@ -1014,6 +1075,7 @@
     if (document.getElementById("stats-dashboard-styles")) return;
 
     const style = createElement("style");
+
     style.id = "stats-dashboard-styles";
 
     style.textContent = `
@@ -1604,17 +1666,27 @@
     injectDashboardStyles();
 
     const existing = document.getElementById("stats-dashboard");
+
     if (existing) existing.remove();
 
     const dashboard = createElement("section", "stats-dashboard");
+
     dashboard.id = "stats-dashboard";
 
     const header = createElement("div", "stats-dashboard-header");
     const heading = createElement("div");
 
     heading.append(
-      createElement("div", "stats-dashboard-eyebrow", "YOUR LISTENING, IN NUMBERS"),
-      createElement("h1", "stats-dashboard-title", "Your listening history"),
+      createElement(
+        "div",
+        "stats-dashboard-eyebrow",
+        "YOUR LISTENING, IN NUMBERS"
+      ),
+      createElement(
+        "h1",
+        "stats-dashboard-title",
+        "Your listening history"
+      ),
       createElement(
         "p",
         "stats-dashboard-subtitle",
@@ -1634,21 +1706,36 @@
     header.append(heading, backButton);
 
     const periodRow = createElement("div", "stats-period-row");
+
     periodRow.appendChild(
-      createElement("span", "stats-period-label", "LISTENING PERIOD")
+      createElement(
+        "span",
+        "stats-period-label",
+        "LISTENING PERIOD"
+      )
     );
 
-    const periodControl = createElement("div", "stats-period-control");
+    const periodControl = createElement(
+      "div",
+      "stats-period-control"
+    );
 
     [
       ["all", "All time"],
       ["year", "Past year"],
       ["month", "Past month"]
     ].forEach(([value, label]) => {
-      const button = createElement("button", "stats-period-button", label);
+      const button = createElement(
+        "button",
+        "stats-period-button",
+        label
+      );
+
       button.type = "button";
 
-      if (value === selectedPeriod) button.classList.add("active");
+      if (value === selectedPeriod) {
+        button.classList.add("active");
+      }
 
       button.addEventListener("click", () => {
         selectedPeriod = value;
@@ -1664,6 +1751,7 @@
       });
 
       button.dataset.period = value;
+
       periodControl.appendChild(button);
     });
 
@@ -1675,32 +1763,38 @@
     const grid = createElement("div", "stats-dashboard-grid");
 
     const artistsPanel = createElement("section", "stats-panel");
+
     artistsPanel.appendChild(
       createPanelHeading("Top Artists", "MOST LISTENED")
     );
 
     const artists = createElement("div", "stats-artist-list");
     artists.id = "stats-top-artists";
+
     artistsPanel.appendChild(artists);
 
     const albumsPanel = createElement("section", "stats-panel");
+
     albumsPanel.appendChild(
       createPanelHeading("Top Albums", "MOST LISTENED")
     );
 
     const albums = createElement("div", "stats-album-list");
     albums.id = "stats-top-albums";
+
     albumsPanel.appendChild(albums);
 
     grid.append(artistsPanel, albumsPanel);
 
     const chartPanel = createElement("section", "stats-panel");
+
     chartPanel.appendChild(
       createPanelHeading("Listening activity", "MONTHLY PLAYS")
     );
 
     const chart = createElement("div", "stats-chart");
     chart.id = "stats-monthly-chart";
+
     chartPanel.appendChild(chart);
 
     const metadataStatus = createElement(
@@ -1708,7 +1802,9 @@
       "stats-metadata-status",
       "Preparing artist metadata..."
     );
+
     metadataStatus.id = "stats-metadata-status";
+
     chartPanel.appendChild(metadataStatus);
 
     dashboard.append(
@@ -1719,9 +1815,6 @@
       chartPanel
     );
 
-    // Place the dashboard beside the upload section, not inside it.
-    // The upload section is hidden after processing, so the dashboard
-    // must not be a child of that hidden section.
     const uploadSection = document.querySelector(".upload-section");
 
     const dashboardContainer =
@@ -1731,6 +1824,14 @@
       document.body;
 
     dashboardContainer.appendChild(dashboard);
+
+    if (uploadSection) {
+      uploadSection.hidden = true;
+    }
+
+    if (privacyCard) {
+      privacyCard.hidden = true;
+    }
 
     renderDashboard();
     createArtistModal();
@@ -1766,6 +1867,7 @@
 
   function renderMetrics(stats) {
     const container = document.getElementById("stats-metrics-grid");
+
     if (!container) return;
 
     container.replaceChildren();
@@ -1808,6 +1910,7 @@
 
   function renderTopArtists(stats) {
     const container = document.getElementById("stats-top-artists");
+
     if (!container) return;
 
     container.replaceChildren();
@@ -1816,18 +1919,32 @@
 
     if (artists.length === 0) {
       container.appendChild(
-        createElement("div", "stats-empty", "No artists found for this period.")
+        createElement(
+          "div",
+          "stats-empty",
+          "No artists found for this period."
+        )
       );
+
       return;
     }
 
     artists.forEach((artist, index) => {
       const row = createElement("button", "stats-artist-row");
-      row.type = "button";
-      row.addEventListener("click", () => openArtistModal(artist.name));
 
-      const imageWrap = createElement("span", "stats-artist-image-wrap");
+      row.type = "button";
+
+      row.addEventListener("click", () => {
+        openArtistModal(artist.name);
+      });
+
+      const imageWrap = createElement(
+        "span",
+        "stats-artist-image-wrap"
+      );
+
       const image = createElement("img", "stats-artist-image");
+
       image.alt = `${artist.name} profile`;
       image.loading = "lazy";
       image.dataset.artistImage = artist.name;
@@ -1838,6 +1955,7 @@
         "stats-artist-image-placeholder",
         "♪"
       );
+
       placeholder.setAttribute("aria-hidden", "true");
 
       image.addEventListener("error", () => {
@@ -1848,6 +1966,7 @@
       imageWrap.append(image, placeholder);
 
       const info = createElement("span", "stats-artist-info");
+
       info.append(
         createElement("span", "stats-artist-name", artist.name),
         createElement(
@@ -1869,10 +1988,12 @@
 
       spotifyLink.target = "_blank";
       spotifyLink.rel = "noopener noreferrer";
-      spotifyLink.setAttribute("aria-label", `Open ${artist.name} on Spotify`);
 
-      // Prevent the artist row from opening the statistics modal
-      // when the Spotify attribution link is clicked.
+      spotifyLink.setAttribute(
+        "aria-label",
+        `Open ${artist.name} on Spotify`
+      );
+
       spotifyLink.addEventListener("click", (event) => {
         event.stopPropagation();
       });
@@ -1896,6 +2017,7 @@
 
   function renderTopAlbums(stats) {
     const container = document.getElementById("stats-top-albums");
+
     if (!container) return;
 
     container.replaceChildren();
@@ -1904,18 +2026,31 @@
 
     if (albums.length === 0) {
       container.appendChild(
-        createElement("div", "stats-empty", "No albums found for this period.")
+        createElement(
+          "div",
+          "stats-empty",
+          "No albums found for this period."
+        )
       );
+
       return;
     }
 
     albums.forEach((album) => {
       const row = createElement("div", "stats-album-row");
 
-      const identity = createElement("div", "stats-album-identity");
-      const coverWrap = createElement("div", "stats-album-cover-wrap");
+      const identity = createElement(
+        "div",
+        "stats-album-identity"
+      );
+
+      const coverWrap = createElement(
+        "div",
+        "stats-album-cover-wrap"
+      );
 
       const cover = createElement("img", "stats-album-cover");
+
       cover.alt = `${album.name} album cover`;
       cover.loading = "lazy";
       cover.dataset.albumKey = getAlbumKey(album);
@@ -1926,6 +2061,7 @@
         "stats-album-cover-placeholder",
         "♪"
       );
+
       placeholder.setAttribute("aria-hidden", "true");
 
       cover.addEventListener("error", () => {
@@ -1934,22 +2070,29 @@
           "stats-album-cover-placeholder",
           "♪"
         );
+
         fallback.setAttribute("aria-hidden", "true");
+
         cover.replaceWith(fallback);
+
         albumCoverCache.set(getAlbumKey(album), null);
       }, { once: true });
 
       coverWrap.append(cover, placeholder);
 
       const info = createElement("div", "stats-album-info");
+
       info.append(
         createElement("div", "stats-album-name", album.name),
-        createElement("div", "stats-album-artist", album.artistName)
+        createElement(
+          "div",
+          "stats-album-artist",
+          album.artistName
+        )
       );
 
       identity.append(coverWrap, info);
 
-      // Spotify track URI is retained on album aggregation records.
       const rowStats = createElement(
         "span",
         "stats-album-count",
@@ -1957,6 +2100,7 @@
       );
 
       row.append(identity, rowStats);
+
       container.appendChild(row);
     });
   }
@@ -1967,6 +2111,7 @@
 
   function renderMonthlyActivity() {
     const container = document.getElementById("stats-monthly-chart");
+
     if (!container) return;
 
     container.replaceChildren();
@@ -1975,22 +2120,33 @@
 
     if (activity.length === 0) {
       container.appendChild(
-        createElement("div", "stats-empty", "No monthly activity found.")
+        createElement(
+          "div",
+          "stats-empty",
+          "No monthly activity found."
+        )
       );
+
       return;
     }
 
-    const maxPlays = Math.max(...activity.map((item) => item[1]), 1);
+    const maxPlays = Math.max(
+      ...activity.map((item) => item[1]),
+      1
+    );
 
     activity.forEach(([key, plays]) => {
       const [year, month] = key.split("-").map(Number);
+
       const date = new Date(year, month - 1, 1);
 
       const column = createElement("div", "stats-chart-column");
       const barWrap = createElement("div", "stats-chart-bar-wrap");
       const bar = createElement("div", "stats-chart-bar");
 
-      bar.style.height = `${Math.max(3, (plays / maxPlays) * 100)}%`;
+      bar.style.height =
+        `${Math.max(3, (plays / maxPlays) * 100)}%`;
+
       bar.title = `${formatNumber(plays)} plays`;
 
       barWrap.appendChild(bar);
@@ -1998,10 +2154,13 @@
       const label = createElement(
         "span",
         "stats-chart-month",
-        date.toLocaleDateString(undefined, { month: "short" })
+        date.toLocaleDateString(undefined, {
+          month: "short"
+        })
       );
 
       column.append(barWrap, label);
+
       container.appendChild(column);
     });
   }
@@ -2014,8 +2173,10 @@
     if (document.getElementById("stats-artist-modal")) return;
 
     const modal = createElement("div", "stats-modal");
+
     modal.id = "stats-artist-modal";
     modal.hidden = true;
+
     modal.setAttribute("role", "dialog");
     modal.setAttribute("aria-modal", "true");
     modal.setAttribute("aria-labelledby", "stats-modal-title");
@@ -2026,29 +2187,57 @@
     const titleArea = createElement("div");
 
     const title = createElement("h2");
+
     title.id = "stats-modal-title";
 
-    const subtitle = createElement("div", "stats-modal-subtitle");
+    const subtitle = createElement(
+      "div",
+      "stats-modal-subtitle"
+    );
+
     subtitle.id = "stats-modal-subtitle";
 
     titleArea.append(title, subtitle);
 
-    const close = createElement("button", "stats-modal-close", "×");
+    const close = createElement(
+      "button",
+      "stats-modal-close",
+      "×"
+    );
+
     close.type = "button";
-    close.setAttribute("aria-label", "Close artist details");
+
+    close.setAttribute(
+      "aria-label",
+      "Close artist details"
+    );
+
     close.addEventListener("click", closeArtistModal);
 
     header.append(titleArea, close);
 
     const metrics = createElement("div", "stats-modal-metrics");
+
     metrics.id = "stats-modal-metrics";
 
-    const songsHeading = createElement("h3", "", "MOST PLAYED SONGS");
+    const songsHeading = createElement(
+      "h3",
+      "",
+      "MOST PLAYED SONGS"
+    );
+
     const songs = createElement("div", "stats-modal-list");
+
     songs.id = "stats-modal-songs";
 
-    const albumsHeading = createElement("h3", "", "TOP ALBUMS");
+    const albumsHeading = createElement(
+      "h3",
+      "",
+      "TOP ALBUMS"
+    );
+
     const albums = createElement("div", "stats-modal-list");
+
     albums.id = "stats-modal-albums";
 
     content.append(
@@ -2063,7 +2252,9 @@
     modal.appendChild(content);
 
     modal.addEventListener("click", (event) => {
-      if (event.target === modal) closeArtistModal();
+      if (event.target === modal) {
+        closeArtistModal();
+      }
     });
 
     document.addEventListener("keydown", (event) => {
@@ -2077,6 +2268,7 @@
 
   function openArtistModal(artistName) {
     const modal = document.getElementById("stats-artist-modal");
+
     if (!modal) return;
 
     const stats = calculateStatistics(getFilteredRecords());
@@ -2087,7 +2279,8 @@
 
     if (!artist) return;
 
-    document.getElementById("stats-modal-title").textContent = artist.name;
+    document.getElementById("stats-modal-title").textContent =
+      artist.name;
 
     document.getElementById("stats-modal-subtitle").textContent =
       selectedPeriod === "month"
@@ -2097,11 +2290,13 @@
           : "Personal listening statistics · All time";
 
     const totalDuration = artist.duration;
+
     const share = stats.totalDuration > 0
       ? ((totalDuration / stats.totalDuration) * 100).toFixed(1)
       : "0.0";
 
     const metrics = document.getElementById("stats-modal-metrics");
+
     metrics.replaceChildren();
 
     [
@@ -2109,15 +2304,21 @@
       ["UNIQUE SONGS", formatNumber(artist.tracks.size)],
       ["LISTENING SHARE", `${share}%`]
     ].forEach(([label, value]) => {
-      const metric = createElement("div", "stats-modal-metric");
+      const metric = createElement(
+        "div",
+        "stats-modal-metric"
+      );
+
       metric.append(
         createElement("strong", "", value),
         createElement("span", "", label)
       );
+
       metrics.appendChild(metric);
     });
 
     const songs = document.getElementById("stats-modal-songs");
+
     songs.replaceChildren();
 
     const topTracks = [...artist.tracks.values()]
@@ -2126,17 +2327,25 @@
 
     if (topTracks.length === 0) {
       songs.appendChild(
-        createElement("div", "stats-empty", "No songs found.")
+        createElement(
+          "div",
+          "stats-empty",
+          "No songs found."
+        )
       );
     } else {
       topTracks.forEach((track) => {
         songs.appendChild(
-          createModalListItem(track.name, `${formatNumber(track.plays)} plays`)
+          createModalListItem(
+            track.name,
+            `${formatNumber(track.plays)} plays`
+          )
         );
       });
     }
 
     const albums = document.getElementById("stats-modal-albums");
+
     albums.replaceChildren();
 
     const topAlbums = [...artist.albums.values()]
@@ -2145,22 +2354,33 @@
 
     if (topAlbums.length === 0) {
       albums.appendChild(
-        createElement("div", "stats-empty", "No album information found.")
+        createElement(
+          "div",
+          "stats-empty",
+          "No album information found."
+        )
       );
     } else {
       topAlbums.forEach((album) => {
         albums.appendChild(
-          createModalListItem(album.name, `${formatNumber(album.plays)} plays`)
+          createModalListItem(
+            album.name,
+            `${formatNumber(album.plays)} plays`
+          )
         );
       });
     }
 
     modal.hidden = false;
+
     document.body.style.overflow = "hidden";
   }
 
   function createModalListItem(name, value) {
-    const item = createElement("div", "stats-modal-list-item");
+    const item = createElement(
+      "div",
+      "stats-modal-list-item"
+    );
 
     item.append(
       createElement("span", "", name),
@@ -2174,6 +2394,7 @@
     const modal = document.getElementById("stats-artist-modal");
 
     if (modal) modal.hidden = true;
+
     document.body.style.overflow = "";
   }
 
@@ -2182,31 +2403,50 @@
   // --------------------------------------------------
 
   function startStatistics() {
-    if (!currentFile || !isValidated || validatedRecords.length === 0) {
+    if (
+      !currentFile ||
+      !isValidated ||
+      validatedRecords.length === 0
+    ) {
+      showMessage(
+        "Your listening history is not ready yet. Please wait for validation to finish.",
+        "info"
+      );
+
       return;
     }
 
     dashboardRecords = validatedRecords.slice();
+
     selectedPeriod = "all";
 
-    // Reset metadata state for the newly imported listening history.
     artistMetadataCache.clear();
     artistImageCache.clear();
     artistMetadataRequests.clear();
+
     albumCoverCache.clear();
     albumCoverRequests.clear();
 
     metadataLoading = false;
     albumCoverLoading = false;
+
     metadataLoadedCount = 0;
     metadataTotalCount = 0;
 
-    createDashboard();
+    try {
+      createDashboard();
 
-    // Release the original upload references after creating the dashboard.
-    validatedRecords = [];
-    currentFile = null;
-    isValidated = false;
+      validatedRecords = [];
+      currentFile = null;
+      isValidated = false;
+
+    } catch (error) {
+      console.error("Dashboard creation failed:", error);
+
+      showMessage(
+        "Your data was successfully read, but the dashboard could not be created. Check the browser Console for details."
+      );
+    }
   }
 
   function returnToUpload() {
@@ -2217,9 +2457,11 @@
     if (modal) modal.remove();
 
     const uploadSection = document.querySelector(".upload-section");
-    if (uploadSection) uploadSection.hidden = false;
 
-    // Restore the privacy disclosure to its original upload-page position.
+    if (uploadSection) {
+      uploadSection.hidden = false;
+    }
+
     if (privacyCard && privacyCardOriginalParent) {
       if (
         privacyCardOriginalNextSibling &&
@@ -2232,6 +2474,7 @@
       } else {
         privacyCardOriginalParent.appendChild(privacyCard);
       }
+
       privacyCard.hidden = false;
     }
 
@@ -2241,31 +2484,37 @@
     artistMetadataCache.clear();
     artistImageCache.clear();
     artistMetadataRequests.clear();
+
     albumCoverCache.clear();
     albumCoverRequests.clear();
 
     metadataLoading = false;
     albumCoverLoading = false;
+
     metadataLoadedCount = 0;
     metadataTotalCount = 0;
 
     resetUpload();
 
-    window.scrollTo({ top: 0, behavior: "smooth" });
+    window.scrollTo({
+      top: 0,
+      behavior: "smooth"
+    });
   }
 
+  // --------------------------------------------------
+  // Process button
+  // --------------------------------------------------
 
-if (processButton) {
-  processButton.addEventListener("click", () => {
-    console.log("PROCESS CLICKED");
-    console.log("Current file:", currentFile);
-    console.log("Is validated:", isValidated);
-    console.log("Validated records:", validatedRecords.length);
+  if (processButton) {
+    processButton.type = "button";
 
-    startStatistics();
-  });
-}
+    processButton.addEventListener("click", (event) => {
+      event.preventDefault();
 
+      startStatistics();
+    });
+  }
 
   // --------------------------------------------------
   // Clear imported data when leaving the page
