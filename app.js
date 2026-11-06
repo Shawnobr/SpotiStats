@@ -41,8 +41,7 @@
   // Image cache is separate so images can be reused without re-fetching metadata.
   const artistImageCache = new Map();
 
-  // Album artwork is resolved through the Cloudflare Worker.
-  // Cloudflare KV provides persistent caching between browser sessions.
+  // Album artwork is resolved from Spotify track links and cached for this session.
   const albumCoverCache = new Map();
   const albumCoverRequests = new Map();
 
@@ -224,7 +223,7 @@
     if (file.size > MAX_FILE_SIZE) {
       currentFile = null;
       showMessage(
-        "This file is larger than the 500 MB limit. Please check your Spotify export and try again."
+        "This file is larger than the 500 MB limit. Please check your Spotify export and try another file."
       );
       return;
     }
@@ -350,111 +349,80 @@
         );
       }
 
-      const header = new Uint8Array(
-        await file.slice(0, 4).arrayBuffer()
-      );
-
-      const validZipSignatures = [
-        [0x50, 0x4b, 0x03, 0x04],
-        [0x50, 0x4b, 0x05, 0x06],
-        [0x50, 0x4b, 0x07, 0x08]
-      ];
-
-      const hasZipSignature = validZipSignatures.some((signature) =>
-        signature.every((byte, index) => header[index] === byte)
-      );
-
-      if (!hasZipSignature) {
-        throw new Error(
-          "This file does not appear to be a valid ZIP archive. Please select the original ZIP file downloaded from Spotify."
-        );
-      }
-
-      showMessage("Opening the ZIP archive...", "info");
-
       const zip = await window.JSZip.loadAsync(file);
 
       if (thisRun !== validationRun) return;
 
-      const historyFiles = Object.values(zip.files).filter(
-        (entry) =>
-          !entry.dir &&
-          isSpotifyHistoryFilename(entry.name)
+      const jsonFiles = Object.values(zip.files).filter(
+        (entry) => !entry.dir && isSpotifyHistoryFilename(entry.name)
       );
 
-      if (historyFiles.length === 0) {
+      if (jsonFiles.length === 0) {
         throw new Error(
-          "We couldn't find any Spotify listening history files. Make sure you downloaded Extended Streaming History rather than your regular Spotify account data."
+          "No Spotify streaming history files were found. Make sure you selected your Extended Streaming History ZIP."
         );
       }
 
-      if (historyFiles.length > MAX_JSON_FILES) {
+      if (jsonFiles.length > MAX_JSON_FILES) {
         throw new Error(
-          "This archive contains an unexpected number of history files. Please check your Spotify export."
+          `Your ZIP contains too many history files. The current limit is ${MAX_JSON_FILES}.`
         );
       }
 
       showMessage(
-        `Found ${historyFiles.length} possible listening history file(s). Checking their contents...`,
+        `Found ${formatNumber(jsonFiles.length)} history files. Reading your listening data...`,
         "info"
       );
 
-      const allRecords = [];
-      let readableFiles = 0;
+      const records = [];
 
-      for (const entry of historyFiles) {
+      for (let index = 0; index < jsonFiles.length; index++) {
         if (thisRun !== validationRun) return;
 
-        let contents;
-
-        try {
-          contents = await entry.async("string");
-        } catch {
-          throw new Error(
-            `We couldn't read "${entry.name}". The ZIP archive may be damaged. Please download it again.`
-          );
-        }
+        const fileEntry = jsonFiles[index];
+        const content = await fileEntry.async("string");
 
         let parsed;
 
         try {
-          parsed = JSON.parse(contents);
+          parsed = JSON.parse(content);
         } catch {
           throw new Error(
-            `The file "${entry.name}" contains unreadable JSON. Your history was not processed. Please download a fresh Spotify export.`
+            `Could not read ${fileEntry.name}. The JSON file appears to be invalid.`
           );
         }
 
-        if (!Array.isArray(parsed)) {
-          throw new Error(
-            `The file "${entry.name}" does not have the expected Spotify history format.`
+        if (!Array.isArray(parsed)) continue;
+
+        parsed.forEach((record) => {
+          const normalized = getSpotifyRecordFields(record);
+
+          if (normalized) records.push(normalized);
+        });
+
+        if ((index + 1) % 10 === 0 || index === jsonFiles.length - 1) {
+          showMessage(
+            `Reading listening history... ${formatNumber(index + 1)} of ${formatNumber(jsonFiles.length)} files`,
+            "info"
           );
-        }
-
-        readableFiles++;
-
-        for (const record of parsed) {
-          const normalizedRecord = getSpotifyRecordFields(record);
-
-          if (normalizedRecord) {
-            allRecords.push(normalizedRecord);
-          }
         }
       }
 
       if (thisRun !== validationRun) return;
 
-      if (readableFiles === 0 || allRecords.length === 0) {
+      if (records.length === 0) {
         throw new Error(
-          "The ZIP file was readable, but we couldn't find any recognizable song listening records. Please make sure you selected your Spotify Extended Streaming History export."
+          "No valid listening records were found in your ZIP file."
         );
       }
 
-      validatedRecords = allRecords;
+      records.sort((a, b) => a.date - b.date);
+
+      validatedRecords = records;
       isValidated = true;
 
       showMessage(
-        `Your Spotify history was successfully recognized! Found ${allRecords.length.toLocaleString()} valid listening records across ${readableFiles} file(s).`,
+        `Successfully read ${formatNumber(records.length)} listening records. Your data is ready.`,
         "success"
       );
 
@@ -463,536 +431,65 @@
     } catch (error) {
       if (thisRun !== validationRun) return;
 
-      currentFile = file;
+      console.error("Spotify ZIP validation failed:", error);
+
       validatedRecords = [];
       isValidated = false;
-
       setButtonState(false);
 
       showMessage(
         error.message ||
-        "Something went wrong while checking your file. Please try again."
+        "Something went wrong while reading your Spotify data."
       );
     }
-  }
-
-  // --------------------------------------------------
-  // Dashboard styling
-  // --------------------------------------------------
-
-  function addDashboardStyles() {
-    if (document.getElementById("spotistats-dashboard-styles")) return;
-
-    const style = document.createElement("style");
-    style.id = "spotistats-dashboard-styles";
-
-    style.textContent = `
-      .stats-dashboard {
-        width: min(1100px, calc(100% - 40px));
-        margin: 50px auto 80px;
-        color: #f2f3ef;
-      }
-
-      .stats-dashboard * {
-        box-sizing: border-box;
-      }
-
-      .stats-topbar {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        gap: 16px;
-        margin-bottom: 38px;
-        flex-wrap: wrap;
-      }
-
-      .stats-eyebrow {
-        color: #d5fb62;
-        font: 11px "DM Mono", monospace;
-        letter-spacing: 1.5px;
-        margin-bottom: 10px;
-      }
-
-      .stats-dashboard h1 {
-        font-size: clamp(28px, 5vw, 42px);
-        line-height: 1.15;
-        margin: 0;
-        font-weight: 800;
-      }
-
-      .stats-dashboard h1 span {
-        color: #d5fb62;
-      }
-
-      .stats-dashboard h2 {
-        font-size: 19px;
-        margin: 0;
-        font-weight: 700;
-      }
-
-      .stats-dashboard p {
-        color: #92959a;
-      }
-
-      .stats-back-button,
-      .stats-period-button,
-      .stats-artist-button,
-      .stats-modal-close {
-        cursor: pointer;
-        font: inherit;
-      }
-
-      .stats-back-button {
-        background: transparent;
-        border: 1px solid #303238;
-        color: #b9bbc0;
-        border-radius: 8px;
-        padding: 10px 14px;
-      }
-
-      .stats-back-button:hover {
-        border-color: #d5fb62;
-        color: #d5fb62;
-      }
-
-      .stats-period {
-        display: flex;
-        gap: 5px;
-        padding: 4px;
-        background: #17191c;
-        border: 1px solid #292c30;
-        border-radius: 9px;
-        width: fit-content;
-        margin: 28px 0 18px;
-      }
-
-      .stats-period-button {
-        border: 0;
-        border-radius: 6px;
-        background: transparent;
-        color: #92959a;
-        padding: 9px 15px;
-        font-size: 12px;
-      }
-
-      .stats-period-button.active {
-        background: #d5fb62;
-        color: #101113;
-        font-weight: 800;
-      }
-
-      .stats-grid {
-        display: grid;
-        grid-template-columns: repeat(3, 1fr);
-        gap: 14px;
-        margin-bottom: 42px;
-      }
-
-      .stats-card,
-      .stats-panel {
-        background: #17191c;
-        border: 1px solid #292c30;
-        border-radius: 12px;
-      }
-
-      .stats-card {
-        padding: 22px;
-      }
-
-      .stats-card-label {
-        color: #92959a;
-        font: 10px "DM Mono", monospace;
-        letter-spacing: 1px;
-      }
-
-      .stats-card-value {
-        display: block;
-        font-size: clamp(27px, 4vw, 38px);
-        font-weight: 800;
-        margin-top: 12px;
-        letter-spacing: -1px;
-      }
-
-      .stats-card-note {
-        display: block;
-        font-size: 11px;
-        color: #777b81;
-        margin-top: 6px;
-      }
-
-      .stats-section {
-        margin-top: 36px;
-      }
-
-      .stats-section-heading {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        gap: 12px;
-        margin-bottom: 16px;
-      }
-
-      .stats-section-label {
-        color: #777b81;
-        font: 10px "DM Mono", monospace;
-        letter-spacing: 1px;
-      }
-
-      .stats-panel {
-        padding: 22px;
-      }
-
-      .stats-search {
-        width: 100%;
-        background: #101113;
-        border: 1px solid #303238;
-        border-radius: 8px;
-        padding: 13px 15px;
-        color: #f2f3ef;
-        font: inherit;
-        outline: none;
-        margin-bottom: 15px;
-      }
-
-      .stats-search:focus {
-        border-color: #d5fb62;
-      }
-
-      .stats-search::placeholder {
-        color: #6f7379;
-      }
-
-      .stats-artist-list,
-      .stats-album-list {
-        display: grid;
-        gap: 8px;
-      }
-
-      .stats-artist-button {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        gap: 15px;
-        text-align: left;
-        width: 100%;
-        padding: 13px 14px;
-        background: #1d2024;
-        border: 1px solid transparent;
-        border-radius: 8px;
-        color: #f2f3ef;
-      }
-
-      .stats-artist-button:hover {
-        border-color: #d5fb62;
-        background: #22262a;
-      }
-
-      .stats-artist-identity {
-        display: flex;
-        align-items: center;
-        gap: 12px;
-        min-width: 0;
-      }
-
-      .stats-artist-avatar {
-        width: 38px;
-        height: 38px;
-        flex: 0 0 38px;
-        display: grid;
-        place-items: center;
-        overflow: hidden;
-        border-radius: 50%;
-        background: #30343a;
-        color: #d5fb62;
-        font: 12px "DM Mono", monospace;
-        object-fit: cover;
-      }
-
-      .stats-artist-name {
-        font-weight: 700;
-        font-size: 13px;
-      }
-
-      .stats-artist-plays {
-        font: 11px "DM Mono", monospace;
-        color: #a5a8ad;
-        white-space: nowrap;
-      }
-
-      .stats-album-row {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        gap: 15px;
-        padding: 13px 0;
-        border-bottom: 1px solid #292c30;
-      }
-
-      .stats-album-row:last-child {
-        border-bottom: 0;
-      }
-
-      .stats-album-identity {
-        display: flex;
-        align-items: center;
-        gap: 12px;
-        min-width: 0;
-      }
-
-      .stats-album-cover,
-      .stats-album-cover-placeholder {
-        width: 48px;
-        height: 48px;
-        flex: 0 0 48px;
-        border-radius: 6px;
-        object-fit: cover;
-        background: #30343a;
-      }
-
-      .stats-album-cover-placeholder {
-        display: grid;
-        place-items: center;
-        color: #d5fb62;
-        font: 14px "DM Mono", monospace;
-      }
-
-      .stats-album-name {
-        font-size: 13px;
-        font-weight: 700;
-      }
-
-      .stats-album-artist {
-        color: #92959a;
-        font-size: 11px;
-        margin-top: 4px;
-      }
-
-      .stats-album-count {
-        color: #a5a8ad;
-        font: 11px "DM Mono", monospace;
-        white-space: nowrap;
-      }
-
-      .stats-chart {
-        display: flex;
-        align-items: end;
-        gap: 8px;
-        height: 190px;
-        padding-top: 20px;
-      }
-
-      .stats-chart-column {
-        flex: 1;
-        min-width: 0;
-        height: 100%;
-        display: flex;
-        flex-direction: column;
-        justify-content: end;
-        align-items: center;
-        gap: 8px;
-      }
-
-      .stats-chart-bar-wrap {
-        width: 100%;
-        height: 145px;
-        display: flex;
-        align-items: end;
-        justify-content: center;
-      }
-
-      .stats-chart-bar {
-        width: min(34px, 75%);
-        min-height: 3px;
-        background: #d5fb62;
-        border-radius: 4px 4px 0 0;
-      }
-
-      .stats-chart-month {
-        font: 9px "DM Mono", monospace;
-        color: #858990;
-        text-align: center;
-      }
-
-      .stats-empty {
-        color: #858990;
-        font-size: 13px;
-        padding: 18px 0;
-        text-align: center;
-      }
-
-      .stats-disclaimer {
-        color: #858990;
-        font-size: 11px;
-        line-height: 1.7;
-        margin-top: 28px;
-      }
-
-      .stats-metadata-status {
-        color: #858990;
-        font: 10px "DM Mono", monospace;
-        margin-top: 8px;
-      }
-
-      .stats-modal {
-        position: fixed;
-        inset: 0;
-        z-index: 10000;
-        background: rgba(0, 0, 0, 0.78);
-        display: flex;
-        justify-content: center;
-        align-items: center;
-        padding: 20px;
-      }
-
-      .stats-modal[hidden] {
-        display: none;
-      }
-
-      .stats-modal-content {
-        width: min(620px, 100%);
-        max-height: 85vh;
-        overflow-y: auto;
-        background: #17191c;
-        border: 1px solid #34373c;
-        border-radius: 14px;
-        padding: 26px;
-      }
-
-      .stats-modal-header {
-        display: flex;
-        justify-content: space-between;
-        align-items: start;
-        gap: 20px;
-      }
-
-      .stats-modal-close {
-        background: transparent;
-        border: 0;
-        color: #a5a8ad;
-        font-size: 26px;
-      }
-
-      .stats-modal-content h2 {
-        font-size: 26px;
-        overflow-wrap: anywhere;
-      }
-
-      .stats-modal-subtitle {
-        color: #92959a;
-        font-size: 12px;
-        margin-top: 7px;
-      }
-
-      .stats-modal-metrics {
-        display: grid;
-        grid-template-columns: repeat(3, 1fr);
-        gap: 9px;
-        margin: 25px 0;
-      }
-
-      .stats-modal-metric {
-        background: #202328;
-        border-radius: 8px;
-        padding: 14px;
-      }
-
-      .stats-modal-metric strong {
-        display: block;
-        font-size: 23px;
-      }
-
-      .stats-modal-metric span {
-        color: #92959a;
-        font: 9px "DM Mono", monospace;
-        display: block;
-        margin-top: 5px;
-      }
-
-      .stats-modal-content h3 {
-        font-size: 13px;
-        margin: 25px 0 10px;
-      }
-
-      .stats-modal-list {
-        display: grid;
-        gap: 9px;
-      }
-
-      .stats-modal-list-item {
-        display: flex;
-        justify-content: space-between;
-        gap: 15px;
-        font-size: 12px;
-        color: #d5d7d2;
-      }
-
-      .stats-modal-list-item span:last-child {
-        color: #92959a;
-        font-family: "DM Mono", monospace;
-        white-space: nowrap;
-      }
-
-      @media (max-width: 650px) {
-        .stats-dashboard {
-          width: calc(100% - 30px);
-          margin-top: 30px;
-        }
-
-        .stats-grid {
-          grid-template-columns: 1fr;
-          gap: 9px;
-        }
-
-        .stats-card {
-          padding: 17px;
-        }
-
-        .stats-card-value {
-          margin-top: 7px;
-        }
-
-        .stats-panel {
-          padding: 16px;
-        }
-
-        .stats-modal-metrics {
-          grid-template-columns: 1fr;
-        }
-
-        .stats-modal-metric {
-          display: flex;
-          justify-content: space-between;
-          align-items: center;
-        }
-
-        .stats-modal-metric span {
-          margin: 0;
-        }
-      }
-    `;
-
-    document.head.appendChild(style);
   }
 
   // --------------------------------------------------
   // Statistics calculations
   // --------------------------------------------------
 
-  function getTrackKey(record) {
-    if (record.spotifyTrackUri) {
-      return `uri:${normalize(record.spotifyTrackUri)}`;
-    }
+  function getUniqueArtistNames() {
+    const names = new Map();
 
-    return `name:${normalize(record.artistName)}::${normalize(record.trackName)}`;
+    dashboardRecords.forEach((record) => {
+      const key = normalizeArtistKey(record.artistName);
+
+      if (key && !names.has(key)) {
+        names.set(key, record.artistName);
+      }
+    });
+
+    return [...names.values()].sort((a, b) => a.localeCompare(b));
+  }
+
+  function getUniqueAlbumNames() {
+    const albums = new Map();
+
+    dashboardRecords.forEach((record) => {
+      if (!record.albumName) return;
+
+      const key =
+        `${normalizeArtistKey(record.artistName)}::${normalize(record.albumName)}`;
+
+      if (!albums.has(key)) {
+        albums.set(key, {
+          name: record.albumName,
+          artistName: record.artistName
+        });
+      }
+    });
+
+    return [...albums.values()];
   }
 
   function getFilteredRecords() {
-    if (selectedPeriod === "all") {
-      return dashboardRecords;
-    }
+    if (selectedPeriod === "all") return dashboardRecords;
 
-    const cutoff = new Date();
-    cutoff.setDate(cutoff.getDate() - (selectedPeriod === "year" ? 365 : 30));
+    const now = new Date();
+    const days = selectedPeriod === "month" ? 30 : 365;
+    const cutoff = new Date(now);
+
+    cutoff.setDate(cutoff.getDate() - days);
 
     return dashboardRecords.filter(
       (record) => record.date >= cutoff
@@ -1000,121 +497,305 @@
   }
 
   function calculateStatistics(records) {
-    const artistMap = new Map();
-    const albumMap = new Map();
-    const trackMap = new Map();
-    const dailyMap = new Map();
+    const artists = new Map();
+    const albums = new Map();
+    const tracks = new Map();
 
-    let totalMinutes = 0;
+    let totalDuration = 0;
+    let totalPlays = 0;
 
-    for (const record of records) {
+    records.forEach((record) => {
+      totalDuration += record.duration;
+      totalPlays++;
+
       const artistKey = normalizeArtistKey(record.artistName);
-      const albumKey = `${artistKey}::${normalize(record.albumName || "Unknown album")}`;
-      const trackKey = getTrackKey(record);
 
-      totalMinutes += record.duration;
-
-      if (!artistMap.has(artistKey)) {
-        artistMap.set(artistKey, {
+      if (!artists.has(artistKey)) {
+        artists.set(artistKey, {
           name: record.artistName,
           plays: 0,
-          minutes: 0,
-          tracks: new Set(),
-          records: []
+          duration: 0,
+          tracks: new Map(),
+          albums: new Map()
         });
       }
 
-      const artist = artistMap.get(artistKey);
+      const artist = artists.get(artistKey);
       artist.plays++;
-      artist.minutes += record.duration;
-      artist.tracks.add(trackKey);
-      artist.records.push(record);
+      artist.duration += record.duration;
 
-      if (!albumMap.has(albumKey)) {
-        albumMap.set(albumKey, {
-          name: record.albumName || "Unknown album",
-          artist: record.artistName,
-          plays: 0,
-          minutes: 0,
-          tracks: new Set(),
-          spotifyTrackUri: record.spotifyTrackUri
-        });
-      }
+      const trackKey =
+        `${artistKey}::${normalize(record.trackName)}`;
 
-      const album = albumMap.get(albumKey);
-      album.plays++;
-      album.minutes += record.duration;
-      album.tracks.add(trackKey);
-
-      if (!trackMap.has(trackKey)) {
-        trackMap.set(trackKey, {
+      if (!tracks.has(trackKey)) {
+        tracks.set(trackKey, {
           name: record.trackName,
-          artist: record.artistName,
-          plays: 0,
-          duration: 0
+          artistName: record.artistName,
+          plays: 0
         });
       }
 
-      const track = trackMap.get(trackKey);
-      track.plays++;
-      track.duration += record.duration;
+      tracks.get(trackKey).plays++;
 
-      const dayKey = record.date.toISOString().slice(0, 10);
-      dailyMap.set(dayKey, (dailyMap.get(dayKey) || 0) + record.duration);
-    }
+      if (!artist.tracks.has(normalize(record.trackName))) {
+        artist.tracks.set(normalize(record.trackName), {
+          name: record.trackName,
+          plays: 0
+        });
+      }
 
-    const artists = Array.from(artistMap.values())
-      .map((artist) => ({
-        ...artist,
-        uniqueTracks: artist.tracks.size
-      }))
-      .sort((a, b) => b.plays - a.plays);
+      artist.tracks.get(normalize(record.trackName)).plays++;
 
-    const albums = Array.from(albumMap.values())
-      .map((album) => ({
-        ...album,
-        uniqueTracks: album.tracks.size
-      }))
-      .sort((a, b) => b.plays - a.plays);
+      if (record.albumName) {
+        const albumKey =
+          `${artistKey}::${normalize(record.albumName)}`;
 
-    const tracks = Array.from(trackMap.values())
-      .sort((a, b) => b.plays - a.plays);
+        if (!albums.has(albumKey)) {
+          albums.set(albumKey, {
+            name: record.albumName,
+            artistName: record.artistName,
+            plays: 0,
+            duration: 0
+          });
+        }
+
+        const album = albums.get(albumKey);
+        album.plays++;
+        album.duration += record.duration;
+
+        if (!artist.albums.has(normalize(record.albumName))) {
+          artist.albums.set(normalize(record.albumName), {
+            name: record.albumName,
+            plays: 0
+          });
+        }
+
+        artist.albums.get(normalize(record.albumName)).plays++;
+      }
+    });
 
     return {
-      totalPlays: records.length,
-      totalMinutes: totalMinutes / 60000,
-      uniqueTracks: trackMap.size,
-      uniqueArtists: artistMap.size,
-      artists,
-      albums,
-      tracks,
-      daily: dailyMap
+      totalPlays,
+      totalDuration,
+      uniqueSongs: tracks.size,
+      uniqueArtists: artists.size,
+      artists: [...artists.values()].sort((a, b) => b.plays - a.plays),
+      albums: [...albums.values()].sort((a, b) => b.plays - a.plays),
+      tracks: [...tracks.values()].sort((a, b) => b.plays - a.plays)
     };
   }
 
+  function getMonthlyActivity(records) {
+    const activity = new Map();
+
+    records.forEach((record) => {
+      const date = record.date;
+      const key =
+        `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
+
+      activity.set(key, (activity.get(key) || 0) + 1);
+    });
+
+    return [...activity.entries()].sort(
+      (a, b) => a[0].localeCompare(b[0])
+    );
+  }
+
   // --------------------------------------------------
-  // Artist and album metadata helpers
+  // Artist metadata helpers
   // --------------------------------------------------
 
-  function getSpotifyTrackUrl(value) {
-    if (!value) return null;
+  function getArtistMetadata(name) {
+    return artistMetadataCache.get(normalizeArtistKey(name)) || null;
+  }
 
-    const textValue = String(value).trim();
+  function storeArtistMetadata(record) {
+    if (!record) return;
 
-    if (textValue.startsWith("spotify:track:")) {
-      const id = textValue.split(":").pop();
-      return id ? `https://open.spotify.com/track/${id}` : null;
+    const requestedName = record.requestedName ||
+      record.identity?.name;
+
+    if (!requestedName) return;
+
+    const key = normalizeArtistKey(requestedName);
+
+    artistMetadataCache.set(key, record);
+
+    const imageUrl =
+      record.images?.spotifyArtistImage ||
+      record.images?.artistThumb ||
+      null;
+
+    if (imageUrl) {
+      artistImageCache.set(key, imageUrl);
+    }
+  }
+
+  async function fetchArtistMetadataBatch(names) {
+    const response = await fetch(`${METADATA_API_URL}/api/artists`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ names })
+    });
+
+    if (!response.ok) {
+      const details = await response.text();
+
+      throw new Error(
+        `Artist metadata request failed: HTTP ${response.status} ${details.slice(0, 250)}`
+      );
+    }
+
+    return response.json();
+  }
+
+  function updateMetadataStatus(message) {
+    const status = document.getElementById("stats-metadata-status");
+
+    if (status) {
+      status.textContent = message;
+    }
+  }
+
+  async function loadAllArtistMetadata() {
+    if (metadataLoading) return;
+
+    const names = getUniqueArtistNames();
+
+    metadataTotalCount = names.length;
+    metadataLoadedCount = 0;
+
+    if (names.length === 0) {
+      updateMetadataStatus("No artist metadata to load.");
+      return;
+    }
+
+    const uncachedNames = names.filter(
+      (name) => !getArtistMetadata(name)
+    );
+
+    if (uncachedNames.length === 0) {
+      metadataLoadedCount = names.length;
+      updateMetadataStatus(
+        `Artist metadata ready · ${formatNumber(names.length)} artists`
+      );
+      refreshArtistImages();
+      return;
+    }
+
+    metadataLoading = true;
+
+    updateMetadataStatus(
+      `Loading artist metadata · 0 of ${formatNumber(names.length)}`
+    );
+
+    try {
+      for (
+        let start = 0;
+        start < uncachedNames.length;
+        start += METADATA_BATCH_SIZE
+      ) {
+        const batch = uncachedNames.slice(
+          start,
+          start + METADATA_BATCH_SIZE
+        );
+
+        // Avoid requesting the same artist more than once in this session.
+        const requestNames = batch.filter((name) => {
+          const key = normalizeArtistKey(name);
+          return !artistMetadataRequests.has(key);
+        });
+
+        if (requestNames.length > 0) {
+          requestNames.forEach((name) => {
+            const key = normalizeArtistKey(name);
+            artistMetadataRequests.set(key, true);
+          });
+
+          try {
+            const data = await fetchArtistMetadataBatch(requestNames);
+
+            data.results.forEach((result) => {
+              if (result.artist) {
+                storeArtistMetadata(result.artist);
+              } else {
+                console.warn(
+                  `No metadata found for ${result.requestedName}:`,
+                  result.error || "No provider match."
+                );
+              }
+            });
+          } finally {
+            requestNames.forEach((name) => {
+              artistMetadataRequests.delete(normalizeArtistKey(name));
+            });
+          }
+        }
+
+        metadataLoadedCount = Math.min(
+          names.length,
+          metadataLoadedCount + batch.length
+        );
+
+        updateMetadataStatus(
+          `Loading artist metadata · ${formatNumber(metadataLoadedCount)} of ${formatNumber(names.length)}`
+        );
+
+        refreshArtistImages();
+      }
+
+      const foundCount = names.filter(
+        (name) => getArtistMetadata(name)
+      ).length;
+
+      updateMetadataStatus(
+        `Artist metadata ready · ${formatNumber(foundCount)} of ${formatNumber(names.length)} artists matched`
+      );
+
+      refreshArtistImages();
+
+    } catch (error) {
+      console.error("Artist metadata loading failed:", error);
+
+      updateMetadataStatus(
+        "Artist metadata could not finish loading. Reload the page to try again."
+      );
+    } finally {
+      metadataLoading = false;
+    }
+  }
+
+  // --------------------------------------------------
+  // Album artwork lookup and prioritized loading
+  // --------------------------------------------------
+
+  function getAlbumKey(album) {
+    return `${normalizeArtistKey(album.artistName)}::${normalize(album.name)}`;
+  }
+
+  function getSpotifyTrackUrl(trackUri) {
+    if (typeof trackUri !== "string" || !trackUri.trim()) {
+      return null;
+    }
+
+    const uri = trackUri.trim();
+
+    if (/^spotify:track:[A-Za-z0-9]+$/.test(uri)) {
+      const id = uri.split(":").pop();
+      return `https://open.spotify.com/track/${id}`;
     }
 
     try {
-      const url = new URL(textValue);
+      const parsed = new URL(uri);
 
       if (
-        url.protocol === "https:" &&
-        url.hostname === "open.spotify.com" &&
-        url.pathname.startsWith("/track/")
+        parsed.protocol === "https:" &&
+        parsed.hostname === "open.spotify.com" &&
+        /^\/track\/[A-Za-z0-9]+\/?$/.test(parsed.pathname)
       ) {
-        return `https://open.spotify.com/track/${url.pathname.split("/")[2]}`;
+        return `https://open.spotify.com${parsed.pathname}`;
       }
     } catch {
       return null;
@@ -1123,60 +804,93 @@
     return null;
   }
 
-  function getAlbumTrackInput(album) {
-    if (!album) return null;
-
-    return getSpotifyTrackUrl(album.spotifyTrackUri);
-  }
-
-  async function fetchAlbumCover(album) {
-    const trackUrl = getAlbumTrackInput(album);
-
+  async function fetchAlbumCover(trackUri) {
+    const trackUrl = getSpotifyTrackUrl(trackUri);
     if (!trackUrl) return null;
 
-    if (albumCoverCache.has(trackUrl)) {
-      return albumCoverCache.get(trackUrl);
+    const response = await fetch(`${METADATA_API_URL}/api/album-cover`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ trackUrl })
+    });
+
+    if (!response.ok) {
+      const details = await response.text();
+
+      throw new Error(
+        `Album artwork request failed: HTTP ${response.status} ${details.slice(0, 200)}`
+      );
     }
 
-    if (albumCoverRequests.has(trackUrl)) {
-      return albumCoverRequests.get(trackUrl);
+    const data = await response.json();
+
+    return data.imageUrl || null;
+  }
+
+  async function getAlbumCover(album) {
+    const key = getAlbumKey(album);
+
+    if (albumCoverCache.has(key)) {
+      return albumCoverCache.get(key);
     }
 
-    const request = (async () => {
-      try {
-        const response = await fetch(`${METADATA_API_URL}/api/album-cover`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            trackUrl
-          })
-        });
+    if (albumCoverRequests.has(key)) {
+      return albumCoverRequests.get(key);
+    }
 
-        if (!response.ok) {
-          throw new Error(`Album artwork lookup failed (${response.status}).`);
-        }
+    const trackUri = album.trackUri;
 
-        const data = await response.json();
-        const imageUrl = data?.imageUrl || null;
+    if (!trackUri) {
+      albumCoverCache.set(key, null);
+      return null;
+    }
 
-        if (imageUrl) {
-          albumCoverCache.set(trackUrl, imageUrl);
-        }
-
+    const request = fetchAlbumCover(trackUri)
+      .then((imageUrl) => {
+        albumCoverCache.set(key, imageUrl);
         return imageUrl;
-      } catch (error) {
-        console.warn("Album artwork lookup failed:", error);
+      })
+      .catch((error) => {
+        console.warn(`Album artwork unavailable for ${album.name}:`, error);
+        albumCoverCache.set(key, null);
         return null;
-      } finally {
-        albumCoverRequests.delete(trackUrl);
-      }
-    })();
+      })
+      .finally(() => {
+        albumCoverRequests.delete(key);
+      });
 
-    albumCoverRequests.set(trackUrl, request);
+    albumCoverRequests.set(key, request);
 
     return request;
+  }
+
+  function getAllTimeAlbums() {
+    const stats = calculateStatistics(dashboardRecords);
+    return stats.albums;
+  }
+
+  async function loadAlbumCoverForAlbum(album) {
+    const imageUrl = await getAlbumCover(album);
+
+    if (!imageUrl) return;
+
+    const key = getAlbumKey(album);
+    const image = document.querySelector(
+      `[data-album-key="${CSS.escape(key)}"]`
+    );
+
+    if (image && image.tagName === "IMG") {
+      image.src = imageUrl;
+      image.hidden = false;
+
+      const placeholder = image.parentElement?.querySelector(
+        ".stats-album-cover-placeholder"
+      );
+
+      if (placeholder) placeholder.hidden = true;
+    }
   }
 
   async function loadAllAlbumCovers() {
@@ -1185,378 +899,855 @@
     albumCoverLoading = true;
 
     try {
-      // Always prioritize albums by all-time play count, regardless of
-      // the currently selected dashboard period.
-      const allTimeStats = calculateStatistics(dashboardRecords);
-      const albums = allTimeStats.albums.filter(
-        (album) => getAlbumTrackInput(album)
-      );
+      const albums = getAllTimeAlbums();
 
-      if (!albums.length) {
-        albumCoverLoading = false;
-        return;
-      }
+      if (!albums.length) return;
 
-      const topAlbums = albums.slice(0, 10);
-      const remainingAlbums = albums.slice(10);
+      const prioritized = albums.slice(0, 10);
+      const remaining = albums.slice(10);
 
-      const loadBatch = async (batch) => {
-        await Promise.all(
-          batch.map(async (album) => {
-            await fetchAlbumCover(album);
-          })
-        );
-
-        renderDashboard();
+      const loadGroup = async (group) => {
+        for (const album of group) {
+          await loadAlbumCoverForAlbum(album);
+        }
       };
 
-      // Load the ten most-listened-to albums first.
-      await loadBatch(topAlbums);
+      await loadGroup(prioritized);
+      await loadGroup(remaining);
 
-      // Continue with the remaining albums in manageable batches.
-      for (
-        let index = 0;
-        index < remainingAlbums.length;
-        index += METADATA_BATCH_SIZE
-      ) {
-        const batch = remainingAlbums.slice(
-          index,
-          index + METADATA_BATCH_SIZE
-        );
-
-        await loadBatch(batch);
-      }
-    } catch (error) {
-      console.warn("Album artwork loading encountered an error:", error);
     } finally {
       albumCoverLoading = false;
     }
   }
 
-  function getArtistMetadataImage(metadata) {
-    if (!metadata || typeof metadata !== "object") return null;
+  // --------------------------------------------------
+  // Artist image rendering and refresh
+  // --------------------------------------------------
 
-    const images = metadata.images || {};
+  function getArtistImageUrl(name) {
+    const metadata = getArtistMetadata(name);
+
+    if (!metadata) return null;
 
     return (
-      images.artistThumb ||
-      images.artistThumbHQ ||
-      images.artistFanart ||
-      images.artistBanner ||
-      images.artistLogo ||
-      images.artistClearart ||
-      metadata.image ||
+      metadata.images?.spotifyArtistImage ||
+      metadata.images?.artistThumb ||
+      artistImageCache.get(normalizeArtistKey(name)) ||
       null
     );
   }
 
-  async function fetchArtistMetadata(artistName) {
-    const artistKey = normalizeArtistKey(artistName);
+  function refreshArtistImages() {
+    document.querySelectorAll("[data-artist-image]").forEach((image) => {
+      const name = image.dataset.artistImage;
+      const imageUrl = getArtistImageUrl(name);
 
-    if (!artistKey) return null;
+      if (!imageUrl || image.src === imageUrl) return;
 
-    if (artistMetadataCache.has(artistKey)) {
-      return artistMetadataCache.get(artistKey);
-    }
+      image.src = imageUrl;
+      image.hidden = false;
 
-    if (artistMetadataRequests.has(artistKey)) {
-      return artistMetadataRequests.get(artistKey);
-    }
-
-    const request = (async () => {
-      try {
-        const response = await fetch(`${METADATA_API_URL}/api/artist?name=${encodeURIComponent(artistName)}`);
-
-        if (!response.ok) {
-          throw new Error(`Artist metadata lookup failed (${response.status}).`);
-        }
-
-        const data = await response.json();
-        const artist = data?.artist || null;
-
-        if (artist) {
-          artistMetadataCache.set(artistKey, artist);
-
-          const image = getArtistMetadataImage(artist);
-
-          if (image) {
-            artistImageCache.set(artistKey, image);
-          }
-        }
-
-        return artist;
-      } catch (error) {
-        console.warn(`Metadata lookup failed for ${artistName}:`, error);
-        return null;
-      } finally {
-        artistMetadataRequests.delete(artistKey);
-      }
-    })();
-
-    artistMetadataRequests.set(artistKey, request);
-
-    return request;
-  }
-
-  async function fetchArtistMetadataBatch(artistNames) {
-    const namesToFetch = artistNames.filter((name) => {
-      const key = normalizeArtistKey(name);
-
-      return (
-        key &&
-        !artistMetadataCache.has(key) &&
-        !artistMetadataRequests.has(key)
+      const placeholder = image.parentElement?.querySelector(
+        ".stats-artist-image-placeholder"
       );
+
+      if (placeholder) placeholder.hidden = true;
     });
-
-    if (!namesToFetch.length) return [];
-
-    const results = [];
-
-    for (
-      let index = 0;
-      index < namesToFetch.length;
-      index += METADATA_BATCH_SIZE
-    ) {
-      const batch = namesToFetch.slice(
-        index,
-        index + METADATA_BATCH_SIZE
-      );
-
-      try {
-        const response = await fetch(`${METADATA_API_URL}/api/artists`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            names: batch
-          })
-        });
-
-        if (!response.ok) {
-          throw new Error(`Artist metadata batch failed (${response.status}).`);
-        }
-
-        const data = await response.json();
-        const batchResults = Array.isArray(data?.results)
-          ? data.results
-          : [];
-
-        for (const result of batchResults) {
-          const requestedName = result.requestedName || "";
-          const key = normalizeArtistKey(requestedName);
-          const artist = result.artist || null;
-
-          if (key && artist) {
-            artistMetadataCache.set(key, artist);
-
-            const image = getArtistMetadataImage(artist);
-
-            if (image) {
-              artistImageCache.set(key, image);
-            }
-          }
-
-          results.push(result);
-        }
-      } catch (error) {
-        console.warn("Artist metadata batch failed:", error);
-      }
-    }
-
-    return results;
   }
 
-  async function loadAllArtistMetadata() {
-    if (metadataLoading) return;
-
-    metadataLoading = true;
-    metadataLoadedCount = 0;
-
-    try {
-      // Prioritize the most-listened-to artists across all time.
-      const allTimeStats = calculateStatistics(dashboardRecords);
-      const artists = allTimeStats.artists;
-
-      metadataTotalCount = artists.length;
-
-      if (!artists.length) {
-        metadataLoading = false;
-        return;
-      }
-
-      const topArtists = artists.slice(0, 10);
-      const remainingArtists = artists.slice(10);
-
-      const updateStatus = () => {
-        const status = document.getElementById("stats-metadata-status");
-
-        if (status) {
-          status.textContent =
-            `Artist images: ${metadataLoadedCount.toLocaleString()} / ${metadataTotalCount.toLocaleString()} processed`;
-        }
-      };
-
-      const loadBatch = async (batch) => {
-        const names = batch.map((artist) => artist.name);
-        await fetchArtistMetadataBatch(names);
-
-        metadataLoadedCount += batch.length;
-        updateStatus();
-        renderDashboard();
-      };
-
-      // Load the ten most-listened-to artists first.
-      await loadBatch(topArtists);
-
-      // Continue with the remaining artists in batches.
-      for (
-        let index = 0;
-        index < remainingArtists.length;
-        index += METADATA_BATCH_SIZE
-      ) {
-        const batch = remainingArtists.slice(
-          index,
-          index + METADATA_BATCH_SIZE
-        );
-
-        await loadBatch(batch);
-      }
-    } catch (error) {
-      console.warn("Artist metadata loading encountered an error:", error);
-    } finally {
-      metadataLoading = false;
-    }
+  function getAllTimeArtists() {
+    const stats = calculateStatistics(dashboardRecords);
+    return stats.artists;
   }
 
-  // --------------------------------------------------
-  // Artist modal
-  // --------------------------------------------------
+  async function loadArtistImageForArtist(name) {
+    const metadata = getArtistMetadata(name);
 
-  function getArtistListeningStats(artistName) {
-    const artistKey = normalizeArtistKey(artistName);
+    if (!metadata) return;
 
-    const records = getFilteredRecords().filter(
-      (record) => normalizeArtistKey(record.artistName) === artistKey
+    const imageUrl = getArtistImageUrl(name);
+
+    if (!imageUrl) return;
+
+    const key = normalizeArtistKey(name);
+
+    artistImageCache.set(key, imageUrl);
+
+    const image = document.querySelector(
+      `[data-artist-image="${CSS.escape(name)}"]`
     );
 
-    const stats = calculateStatistics(records);
+    if (image) {
+      image.src = imageUrl;
+      image.hidden = false;
 
-    return {
-      records,
-      stats
-    };
+      const placeholder = image.parentElement?.querySelector(
+        ".stats-artist-image-placeholder"
+      );
+
+      if (placeholder) placeholder.hidden = true;
+    }
   }
 
-  function showArtistModal(artistName) {
-    const existing = document.querySelector(".stats-modal");
+  async function loadAllArtistImages() {
+    const artists = getAllTimeArtists();
 
+    if (!artists.length) return;
+
+    const prioritized = artists.slice(0, 10);
+    const remaining = artists.slice(10);
+
+    for (const artist of prioritized) {
+      await loadArtistImageForArtist(artist.name);
+    }
+
+    for (const artist of remaining) {
+      await loadArtistImageForArtist(artist.name);
+    }
+  }
+
+  // --------------------------------------------------
+  // Dashboard structure and styling
+  // --------------------------------------------------
+
+  function injectDashboardStyles() {
+    if (document.getElementById("stats-dashboard-styles")) return;
+
+    const style = createElement("style");
+    style.id = "stats-dashboard-styles";
+
+    style.textContent = `
+      .stats-dashboard {
+        width: 100%;
+        max-width: 1180px;
+        margin: 0 auto;
+        padding: 42px 0 80px;
+        color: #f1f3ed;
+      }
+
+      .stats-dashboard *,
+      .stats-dashboard *::before,
+      .stats-dashboard *::after {
+        box-sizing: border-box;
+      }
+
+      .stats-dashboard-header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 24px;
+        margin-bottom: 34px;
+      }
+
+      .stats-dashboard-eyebrow {
+        color: #d5fb62;
+        font-family: "DM Mono", monospace;
+        font-size: 10px;
+        letter-spacing: 0.14em;
+        margin-bottom: 12px;
+      }
+
+      .stats-dashboard-title {
+        margin: 0;
+        color: #f1f3ed;
+        font-family: "Manrope", sans-serif;
+        font-size: clamp(30px, 5vw, 46px);
+        font-weight: 700;
+        letter-spacing: -0.055em;
+        line-height: 1.05;
+      }
+
+      .stats-dashboard-subtitle {
+        margin-top: 12px;
+        color: #92988e;
+        font-size: 13px;
+        line-height: 1.6;
+      }
+
+      .stats-dashboard-back {
+        flex-shrink: 0;
+        border: 1px solid rgba(255,255,255,0.12);
+        border-radius: 7px;
+        padding: 10px 13px;
+        background: transparent;
+        color: #c6cbbf;
+        font: inherit;
+        font-size: 11px;
+        cursor: pointer;
+        transition: 0.2s ease;
+      }
+
+      .stats-dashboard-back:hover {
+        border-color: rgba(213,251,98,0.45);
+        color: #d5fb62;
+      }
+
+      .stats-period-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        margin-bottom: 20px;
+      }
+
+      .stats-period-label {
+        color: #8e958b;
+        font-family: "DM Mono", monospace;
+        font-size: 10px;
+        letter-spacing: 0.1em;
+      }
+
+      .stats-period-control {
+        display: flex;
+        gap: 5px;
+        padding: 4px;
+        border: 1px solid rgba(255,255,255,0.09);
+        border-radius: 8px;
+        background: rgba(255,255,255,0.025);
+      }
+
+      .stats-period-button {
+        border: 0;
+        border-radius: 5px;
+        padding: 8px 12px;
+        background: transparent;
+        color: #8e958b;
+        font: inherit;
+        font-size: 11px;
+        cursor: pointer;
+        transition: 0.2s ease;
+      }
+
+      .stats-period-button:hover {
+        color: #f1f3ed;
+      }
+
+      .stats-period-button.active {
+        background: #d5fb62;
+        color: #171a13;
+        font-weight: 700;
+      }
+
+      .stats-metrics-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 12px;
+        margin-bottom: 30px;
+      }
+
+      .stats-metric-card {
+        min-width: 0;
+        padding: 20px;
+        border: 1px solid rgba(255,255,255,0.085);
+        border-radius: 9px;
+        background: rgba(255,255,255,0.025);
+      }
+
+      .stats-metric-label {
+        color: #92988e;
+        font-family: "DM Mono", monospace;
+        font-size: 9px;
+        letter-spacing: 0.1em;
+        line-height: 1.5;
+      }
+
+      .stats-metric-value {
+        margin-top: 12px;
+        color: #f1f3ed;
+        font-family: "Manrope", sans-serif;
+        font-size: clamp(23px, 3vw, 32px);
+        font-weight: 700;
+        letter-spacing: -0.045em;
+        overflow-wrap: anywhere;
+      }
+
+      .stats-metric-detail {
+        margin-top: 5px;
+        color: #70786e;
+        font-size: 10px;
+      }
+
+      .stats-dashboard-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
+        gap: 14px;
+        margin-bottom: 14px;
+      }
+
+      .stats-panel {
+        min-width: 0;
+        padding: 22px;
+        border: 1px solid rgba(255,255,255,0.085);
+        border-radius: 9px;
+        background: rgba(255,255,255,0.025);
+      }
+
+      .stats-panel-heading {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 20px;
+      }
+
+      .stats-panel-title {
+        margin: 0;
+        color: #f1f3ed;
+        font-family: "Manrope", sans-serif;
+        font-size: 14px;
+        font-weight: 700;
+      }
+
+      .stats-panel-kicker {
+        color: #777f74;
+        font-family: "DM Mono", monospace;
+        font-size: 9px;
+        letter-spacing: 0.08em;
+      }
+
+      .stats-artist-list,
+      .stats-album-list {
+        display: flex;
+        flex-direction: column;
+        gap: 9px;
+      }
+
+      .stats-artist-row {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        width: 100%;
+        min-width: 0;
+        padding: 8px;
+        border: 1px solid transparent;
+        border-radius: 7px;
+        background: transparent;
+        color: inherit;
+        text-align: left;
+        cursor: pointer;
+        transition: 0.18s ease;
+      }
+
+      .stats-artist-row:hover {
+        border-color: rgba(213,251,98,0.14);
+        background: rgba(213,251,98,0.035);
+      }
+
+      .stats-artist-image-wrap {
+        position: relative;
+        display: grid;
+        place-items: center;
+        flex-shrink: 0;
+        width: 42px;
+        height: 42px;
+        overflow: hidden;
+        border-radius: 50%;
+        background: rgba(255,255,255,0.06);
+      }
+
+      .stats-artist-image {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+      }
+
+      .stats-artist-image-placeholder {
+        color: #aab19f;
+        font-size: 16px;
+      }
+
+      .stats-artist-info {
+        flex: 1;
+        min-width: 0;
+      }
+
+      .stats-artist-name {
+        overflow: hidden;
+        color: #e7eadf;
+        font-size: 12px;
+        font-weight: 650;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .stats-artist-plays {
+        margin-top: 4px;
+        color: #7e8679;
+        font-family: "DM Mono", monospace;
+        font-size: 9px;
+      }
+
+      .stats-artist-count {
+        flex-shrink: 0;
+        color: #a5ad9e;
+        font-family: "DM Mono", monospace;
+        font-size: 10px;
+      }
+
+      .stats-artist-spotify-link {
+        flex-shrink: 0;
+        color: #a6b092;
+        font-size: 9px;
+        text-decoration: none;
+      }
+
+      .stats-artist-spotify-link:hover {
+        color: #d5fb62;
+        text-decoration: underline;
+      }
+
+      .stats-album-row {
+        display: flex;
+        align-items: center;
+        gap: 11px;
+        min-width: 0;
+        padding: 7px 0;
+      }
+
+      .stats-album-identity {
+        display: flex;
+        align-items: center;
+        flex: 1;
+        min-width: 0;
+        gap: 11px;
+      }
+
+      .stats-album-cover-wrap {
+        position: relative;
+        display: grid;
+        place-items: center;
+        flex-shrink: 0;
+        width: 42px;
+        height: 42px;
+        overflow: hidden;
+        border-radius: 5px;
+        background: rgba(255,255,255,0.06);
+      }
+
+      .stats-album-cover {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+      }
+
+      .stats-album-cover-placeholder {
+        color: #aab19f;
+        font-size: 16px;
+      }
+
+      .stats-album-info {
+        flex: 1;
+        min-width: 0;
+      }
+
+      .stats-album-name {
+        overflow: hidden;
+        color: #e7eadf;
+        font-size: 11px;
+        font-weight: 650;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .stats-album-artist {
+        overflow: hidden;
+        margin-top: 4px;
+        color: #7e8679;
+        font-size: 10px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .stats-album-count {
+        flex-shrink: 0;
+        color: #a5ad9e;
+        font-family: "DM Mono", monospace;
+        font-size: 9px;
+      }
+
+      .stats-chart {
+        display: flex;
+        align-items: stretch;
+        gap: 8px;
+        height: 190px;
+        padding-top: 10px;
+      }
+
+      .stats-chart-column {
+        display: flex;
+        flex: 1;
+        flex-direction: column;
+        align-items: center;
+        justify-content: flex-end;
+        min-width: 0;
+        gap: 8px;
+      }
+
+      .stats-chart-bar-wrap {
+        display: flex;
+        align-items: flex-end;
+        justify-content: center;
+        width: 100%;
+        height: 150px;
+      }
+
+      .stats-chart-bar {
+        width: min(100%, 28px);
+        min-height: 3px;
+        border-radius: 4px 4px 1px 1px;
+        background: #d5fb62;
+        opacity: 0.85;
+        transition: height 0.3s ease;
+      }
+
+      .stats-chart-month {
+        color: #737c70;
+        font-family: "DM Mono", monospace;
+        font-size: 8px;
+      }
+
+      .stats-empty {
+        padding: 24px 10px;
+        color: #747d70;
+        font-size: 11px;
+        text-align: center;
+      }
+
+      .stats-metadata-status {
+        margin-top: 14px;
+        color: #737c70;
+        font-family: "DM Mono", monospace;
+        font-size: 9px;
+        line-height: 1.6;
+      }
+
+      .stats-modal {
+        position: fixed;
+        z-index: 9999;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        padding: 20px;
+        background: rgba(0,0,0,0.78);
+        backdrop-filter: blur(8px);
+      }
+
+      .stats-modal[hidden] {
+        display: none;
+      }
+
+      .stats-modal-content {
+        width: min(100%, 560px);
+        max-height: min(85vh, 760px);
+        overflow-y: auto;
+        padding: 25px;
+        border: 1px solid rgba(255,255,255,0.12);
+        border-radius: 11px;
+        background: #171b15;
+      }
+
+      .stats-modal-header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 18px;
+        margin-bottom: 22px;
+      }
+
+      .stats-modal-header h2 {
+        margin: 0;
+        color: #f1f3ed;
+        font-family: "Manrope", sans-serif;
+        font-size: 24px;
+        letter-spacing: -0.04em;
+      }
+
+      .stats-modal-subtitle {
+        margin-top: 6px;
+        color: #858d7f;
+        font-size: 10px;
+      }
+
+      .stats-modal-close {
+        width: 32px;
+        height: 32px;
+        border: 1px solid rgba(255,255,255,0.12);
+        border-radius: 6px;
+        background: transparent;
+        color: #c6cbbf;
+        font-size: 21px;
+        cursor: pointer;
+      }
+
+      .stats-modal-metrics {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 9px;
+        margin-bottom: 25px;
+      }
+
+      .stats-modal-metric {
+        padding: 13px;
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 7px;
+        background: rgba(255,255,255,0.025);
+      }
+
+      .stats-modal-metric strong {
+        display: block;
+        color: #d5fb62;
+        font-family: "Manrope", sans-serif;
+        font-size: 20px;
+      }
+
+      .stats-modal-metric span {
+        display: block;
+        margin-top: 5px;
+        color: #7d8678;
+        font-family: "DM Mono", monospace;
+        font-size: 8px;
+        letter-spacing: 0.07em;
+      }
+
+      .stats-modal-content h3 {
+        margin: 22px 0 10px;
+        color: #8b9485;
+        font-family: "DM Mono", monospace;
+        font-size: 9px;
+        font-weight: 400;
+        letter-spacing: 0.1em;
+      }
+
+      .stats-modal-list {
+        display: flex;
+        flex-direction: column;
+      }
+
+      .stats-modal-list-item {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 15px;
+        padding: 10px 0;
+        border-bottom: 1px solid rgba(255,255,255,0.06);
+        color: #dfe3d8;
+        font-size: 11px;
+      }
+
+      .stats-modal-list-item span:last-child {
+        flex-shrink: 0;
+        color: #879080;
+        font-family: "DM Mono", monospace;
+        font-size: 9px;
+      }
+
+      @media (max-width: 760px) {
+        .stats-dashboard {
+          padding-top: 28px;
+        }
+
+        .stats-metrics-grid {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        .stats-dashboard-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      @media (max-width: 480px) {
+        .stats-dashboard-header {
+          flex-direction: column;
+          gap: 17px;
+        }
+
+        .stats-dashboard-back {
+          order: 2;
+        }
+
+        .stats-period-row {
+          align-items: flex-start;
+          flex-direction: column;
+        }
+
+        .stats-period-control {
+          width: 100%;
+        }
+
+        .stats-period-button {
+          flex: 1;
+          padding-inline: 7px;
+        }
+
+        .stats-panel {
+          padding: 17px;
+        }
+
+        .stats-metric-card {
+          padding: 15px;
+        }
+
+        .stats-chart {
+          gap: 4px;
+        }
+
+        .stats-modal-content {
+          padding: 19px;
+        }
+      }
+    `;
+
+    document.head.appendChild(style);
+  }
+
+  function createDashboard() {
+    injectDashboardStyles();
+
+    const existing = document.getElementById("stats-dashboard");
     if (existing) existing.remove();
 
-    const { records, stats } = getArtistListeningStats(artistName);
+    const dashboard = createElement("section", "stats-dashboard");
+    dashboard.id = "stats-dashboard";
 
-    const modal = createElement("div", "stats-modal");
-    modal.setAttribute("role", "dialog");
-    modal.setAttribute("aria-modal", "true");
-    modal.setAttribute("aria-label", `${artistName} listening statistics`);
+    const header = createElement("div", "stats-dashboard-header");
+    const heading = createElement("div");
 
-    const content = createElement("div", "stats-modal-content");
+    heading.append(
+      createElement("div", "stats-dashboard-eyebrow", "YOUR LISTENING, IN NUMBERS"),
+      createElement("h1", "stats-dashboard-title", "Your listening history"),
+      createElement(
+        "p",
+        "stats-dashboard-subtitle",
+        `${formatNumber(dashboardRecords.length)} listening records analyzed`
+      )
+    );
 
-    const header = createElement("div", "stats-modal-header");
-    const headingGroup = createElement("div");
-    const heading = createElement("h2", "", artistName);
-    const subtitle = createElement(
+    const backButton = createElement(
+      "button",
+      "stats-dashboard-back",
+      "← Upload another file"
+    );
+
+    backButton.type = "button";
+    backButton.addEventListener("click", returnToUpload);
+
+    header.append(heading, backButton);
+
+    const periodRow = createElement("div", "stats-period-row");
+    periodRow.appendChild(
+      createElement("span", "stats-period-label", "LISTENING PERIOD")
+    );
+
+    const periodControl = createElement("div", "stats-period-control");
+
+    [
+      ["all", "All time"],
+      ["year", "Past year"],
+      ["month", "Past month"]
+    ].forEach(([value, label]) => {
+      const button = createElement("button", "stats-period-button", label);
+      button.type = "button";
+
+      if (value === selectedPeriod) button.classList.add("active");
+
+      button.addEventListener("click", () => {
+        selectedPeriod = value;
+
+        periodControl.querySelectorAll("button").forEach((item) => {
+          item.classList.toggle(
+            "active",
+            item.dataset.period === selectedPeriod
+          );
+        });
+
+        renderDashboard();
+      });
+
+      button.dataset.period = value;
+      periodControl.appendChild(button);
+    });
+
+    periodRow.appendChild(periodControl);
+
+    const metrics = createElement("div", "stats-metrics-grid");
+    metrics.id = "stats-metrics-grid";
+
+    const grid = createElement("div", "stats-dashboard-grid");
+
+    const artistsPanel = createElement("section", "stats-panel");
+    artistsPanel.appendChild(
+      createPanelHeading("Top Artists", "MOST LISTENED")
+    );
+
+    const artists = createElement("div", "stats-artist-list");
+    artists.id = "stats-top-artists";
+    artistsPanel.appendChild(artists);
+
+    const albumsPanel = createElement("section", "stats-panel");
+    albumsPanel.appendChild(
+      createPanelHeading("Top Albums", "MOST LISTENED")
+    );
+
+    const albums = createElement("div", "stats-album-list");
+    albums.id = "stats-top-albums";
+    albumsPanel.appendChild(albums);
+
+    grid.append(artistsPanel, albumsPanel);
+
+    const chartPanel = createElement("section", "stats-panel");
+    chartPanel.appendChild(
+      createPanelHeading("Listening activity", "MONTHLY PLAYS")
+    );
+
+    const chart = createElement("div", "stats-chart");
+    chart.id = "stats-monthly-chart";
+    chartPanel.appendChild(chart);
+
+    const metadataStatus = createElement(
       "div",
-      "stats-modal-subtitle",
-      `${formatNumber(stats.totalPlays)} plays in the selected period`
+      "stats-metadata-status",
+      "Preparing artist metadata..."
     );
+    metadataStatus.id = "stats-metadata-status";
+    chartPanel.appendChild(metadataStatus);
 
-    headingGroup.append(heading, subtitle);
-
-    const closeButton = createElement("button", "stats-modal-close", "×");
-    closeButton.type = "button";
-    closeButton.setAttribute("aria-label", "Close artist statistics");
-    closeButton.addEventListener("click", () => modal.remove());
-
-    header.append(headingGroup, closeButton);
-
-    const metrics = createElement("div", "stats-modal-metrics");
-
-    const metricData = [
-      ["TOTAL PLAYS", formatNumber(stats.totalPlays)],
-      ["LISTENING TIME", formatDuration(stats.totalMinutes * 60000)],
-      ["UNIQUE SONGS", formatNumber(stats.uniqueTracks)]
-    ];
-
-    for (const [label, value] of metricData) {
-      const metric = createElement("div", "stats-modal-metric");
-      const strong = createElement("strong", "", value);
-      const span = createElement("span", "", label);
-      metric.append(strong, span);
-      metrics.appendChild(metric);
-    }
-
-    const topTracksHeading = createElement("h3", "", "MOST PLAYED SONGS");
-    const topTracksList = createElement("div", "stats-modal-list");
-
-    const topTracks = stats.tracks.slice(0, 10);
-
-    if (!topTracks.length) {
-      topTracksList.appendChild(
-        createElement("div", "stats-empty", "No listening data for this artist in this period.")
-      );
-    } else {
-      for (const track of topTracks) {
-        const item = createElement("div", "stats-modal-list-item");
-        const name = createElement("span", "", track.name);
-        const count = createElement("span", "", `${formatNumber(track.plays)} plays`);
-        item.append(name, count);
-        topTracksList.appendChild(item);
-      }
-    }
-
-    const albumsHeading = createElement("h3", "", "MOST PLAYED ALBUMS");
-    const albumsList = createElement("div", "stats-modal-list");
-
-    if (!stats.albums.length) {
-      albumsList.appendChild(
-        createElement("div", "stats-empty", "No album data available.")
-      );
-    } else {
-      for (const album of stats.albums.slice(0, 10)) {
-        const item = createElement("div", "stats-modal-list-item");
-        const name = createElement("span", "", album.name);
-        const count = createElement("span", "", `${formatNumber(album.plays)} plays`);
-        item.append(name, count);
-        albumsList.appendChild(item);
-      }
-    }
-
-    content.append(
+    dashboard.append(
       header,
+      periodRow,
       metrics,
-      topTracksHeading,
-      topTracksList,
-      albumsHeading,
-      albumsList
+      grid,
+      chartPanel
     );
 
-    modal.appendChild(content);
+    // Place the dashboard beside the upload section, not inside it.
+    // The upload section is hidden after processing, so the dashboard
+    // must not be a child of that hidden section.
+    const uploadSection = document.querySelector(".upload-section");
 
-    modal.addEventListener("click", (event) => {
-      if (event.target === modal) modal.remove();
-    });
+    const dashboardContainer =
+      uploadSection?.parentElement ||
+      document.querySelector(".page-shell") ||
+      document.querySelector("main") ||
+      document.body;
 
-    document.addEventListener("keydown", function handleEscape(event) {
-      if (event.key === "Escape" && modal.isConnected) {
-        modal.remove();
-        document.removeEventListener("keydown", handleEscape);
-      }
-    });
+    dashboardContainer.appendChild(dashboard);
 
-    document.body.appendChild(modal);
-    closeButton.focus();
+    renderDashboard();
+    createArtistModal();
+
+    loadAllArtistMetadata();
+    loadAllAlbumCovers();
+  }
+
+  function createPanelHeading(title, kicker) {
+    const heading = createElement("div", "stats-panel-heading");
+
+    heading.append(
+      createElement("h2", "stats-panel-title", title),
+      createElement("span", "stats-panel-kicker", kicker)
+    );
+
+    return heading;
   }
 
   // --------------------------------------------------
@@ -1564,331 +1755,469 @@
   // --------------------------------------------------
 
   function renderDashboard() {
-    const dashboard = document.querySelector(".stats-dashboard");
-
-    if (!dashboard) return;
-
     const records = getFilteredRecords();
     const stats = calculateStatistics(records);
 
-    const totalPlaysValue = document.getElementById("stats-total-plays");
-    const totalMinutesValue = document.getElementById("stats-total-minutes");
-    const uniqueTracksValue = document.getElementById("stats-unique-tracks");
-    const uniqueArtistsValue = document.getElementById("stats-unique-artists");
+    renderMetrics(stats);
+    renderTopArtists(stats);
+    renderTopAlbums(stats);
+    renderMonthlyActivity();
+  }
 
-    if (totalPlaysValue) {
-      totalPlaysValue.textContent = formatNumber(stats.totalPlays);
-    }
+  function renderMetrics(stats) {
+    const container = document.getElementById("stats-metrics-grid");
+    if (!container) return;
 
-    if (totalMinutesValue) {
-      totalMinutesValue.textContent = formatDuration(stats.totalMinutes * 60000);
-    }
+    container.replaceChildren();
 
-    if (uniqueTracksValue) {
-      uniqueTracksValue.textContent = formatNumber(stats.uniqueTracks);
-    }
-
-    if (uniqueArtistsValue) {
-      uniqueArtistsValue.textContent = formatNumber(stats.uniqueArtists);
-    }
-
-    const artistList = document.getElementById("stats-artist-list");
-
-    if (artistList) {
-      artistList.innerHTML = "";
-
-      const topArtists = stats.artists.slice(0, 10);
-
-      if (!topArtists.length) {
-        artistList.appendChild(
-          createElement("div", "stats-empty", "No artists found for this period.")
-        );
+    const metrics = [
+      {
+        label: "TOTAL PLAYS",
+        value: formatNumber(stats.totalPlays),
+        detail: "Listening sessions"
+      },
+      {
+        label: "LISTENING TIME",
+        value: formatDuration(stats.totalDuration),
+        detail: "Total time listened"
+      },
+      {
+        label: "UNIQUE SONGS",
+        value: formatNumber(stats.uniqueSongs),
+        detail: "Distinct tracks played"
+      },
+      {
+        label: "UNIQUE ARTISTS",
+        value: formatNumber(stats.uniqueArtists),
+        detail: "Distinct artists"
       }
+    ];
 
-      for (const artist of topArtists) {
-        const button = createElement("button", "stats-artist-button");
-        button.type = "button";
+    metrics.forEach((item) => {
+      const card = createElement("div", "stats-metric-card");
 
-        const identity = createElement("div", "stats-artist-identity");
-        const artistKey = normalizeArtistKey(artist.name);
-        const imageUrl = artistImageCache.get(artistKey);
+      card.append(
+        createElement("div", "stats-metric-label", item.label),
+        createElement("div", "stats-metric-value", item.value),
+        createElement("div", "stats-metric-detail", item.detail)
+      );
 
-        let avatar;
+      container.appendChild(card);
+    });
+  }
 
-        if (imageUrl) {
-          avatar = createElement("img", "stats-artist-avatar");
-          avatar.src = imageUrl;
-          avatar.alt = `${artist.name} profile`;
-          avatar.loading = "lazy";
-        } else {
-          avatar = createElement(
-            "div",
-            "stats-artist-avatar",
-            artist.name.slice(0, 1).toUpperCase()
-          );
-        }
+  function renderTopArtists(stats) {
+    const container = document.getElementById("stats-top-artists");
+    if (!container) return;
 
-        const name = createElement("span", "stats-artist-name", artist.name);
-        identity.append(avatar, name);
+    container.replaceChildren();
 
-        const plays = createElement(
+    const artists = stats.artists.slice(0, 10);
+
+    if (artists.length === 0) {
+      container.appendChild(
+        createElement("div", "stats-empty", "No artists found for this period.")
+      );
+      return;
+    }
+
+    artists.forEach((artist, index) => {
+      const row = createElement("button", "stats-artist-row");
+      row.type = "button";
+      row.addEventListener("click", () => openArtistModal(artist.name));
+
+      const imageWrap = createElement("span", "stats-artist-image-wrap");
+      const image = createElement("img", "stats-artist-image");
+      image.alt = `${artist.name} profile`;
+      image.loading = "lazy";
+      image.dataset.artistImage = artist.name;
+      image.hidden = true;
+
+      const placeholder = createElement(
+        "span",
+        "stats-artist-image-placeholder",
+        "♪"
+      );
+      placeholder.setAttribute("aria-hidden", "true");
+
+      image.addEventListener("error", () => {
+        image.hidden = true;
+        placeholder.hidden = false;
+      }, { once: true });
+
+      imageWrap.append(image, placeholder);
+
+      const info = createElement("span", "stats-artist-info");
+      info.append(
+        createElement("span", "stats-artist-name", artist.name),
+        createElement(
           "span",
           "stats-artist-plays",
           `${formatNumber(artist.plays)} plays`
-        );
+        )
+      );
 
-        button.append(identity, plays);
-        button.addEventListener("click", () => showArtistModal(artist.name));
+      const spotifyLink = createElement(
+        "a",
+        "stats-artist-spotify-link",
+        "Spotify ↗"
+      );
 
-        artistList.appendChild(button);
-      }
-    }
+      spotifyLink.href =
+        getArtistMetadata(artist.name)?.links?.spotifyArtist ||
+        `https://open.spotify.com/search/${encodeURIComponent(artist.name)}`;
 
-    const albumList = document.getElementById("stats-album-list");
+      spotifyLink.target = "_blank";
+      spotifyLink.rel = "noopener noreferrer";
+      spotifyLink.setAttribute("aria-label", `Open ${artist.name} on Spotify`);
 
-    if (albumList) {
-      albumList.innerHTML = "";
+      // Prevent the artist row from opening the statistics modal
+      // when the Spotify attribution link is clicked.
+      spotifyLink.addEventListener("click", (event) => {
+        event.stopPropagation();
+      });
 
-      const topAlbums = stats.albums.slice(0, 10);
-
-      if (!topAlbums.length) {
-        albumList.appendChild(
-          createElement("div", "stats-empty", "No albums found for this period.")
-        );
-      }
-
-      for (const album of topAlbums) {
-        const row = createElement("div", "stats-album-row");
-        const identity = createElement("div", "stats-album-identity");
-        const trackUrl = getAlbumTrackInput(album);
-        const coverUrl = trackUrl ? albumCoverCache.get(trackUrl) : null;
-
-        if (coverUrl) {
-          const image = createElement("img", "stats-album-cover");
-          image.src = coverUrl;
-          image.alt = `${album.name} album cover`;
-          image.loading = "lazy";
-          identity.appendChild(image);
-        } else {
-          identity.appendChild(
-            createElement("div", "stats-album-cover-placeholder", "♪")
-          );
-        }
-
-        const details = createElement("div");
-        details.append(
-          createElement("div", "stats-album-name", album.name),
-          createElement("div", "stats-album-artist", album.artist)
-        );
-
-        identity.appendChild(details);
-
-        const count = createElement(
+      row.append(
+        imageWrap,
+        info,
+        createElement(
           "span",
-          "stats-album-count",
-          `${formatNumber(album.plays)} plays`
-        );
+          "stats-artist-count",
+          `#${index + 1}`
+        ),
+        spotifyLink
+      );
 
-        row.append(identity, count);
-        albumList.appendChild(row);
-      }
-    }
-
-    const metadataStatus = document.getElementById("stats-metadata-status");
-
-    if (metadataStatus && !metadataLoading) {
-      metadataStatus.textContent =
-        metadataLoadedCount > 0
-          ? `Artist images: ${metadataLoadedCount.toLocaleString()} / ${metadataTotalCount.toLocaleString()} processed`
-          : "Artist images load automatically, starting with your most-listened-to artists.";
-    }
-
-    renderListeningChart(stats);
-  }
-
-  function renderListeningChart(stats) {
-    const chart = document.getElementById("stats-listening-chart");
-
-    if (!chart) return;
-
-    chart.innerHTML = "";
-
-    const daily = stats.daily;
-    const dates = [];
-
-    const today = new Date();
-
-    for (let index = 6; index >= 0; index--) {
-      const date = new Date(today);
-      date.setDate(today.getDate() - index);
-      dates.push(date);
-    }
-
-    const values = dates.map((date) => {
-      const key = date.toISOString().slice(0, 10);
-      return daily.get(key) || 0;
+      container.appendChild(row);
     });
 
-    const maximum = Math.max(...values, 1);
+    refreshArtistImages();
+  }
 
-    for (let index = 0; index < dates.length; index++) {
+  function renderTopAlbums(stats) {
+    const container = document.getElementById("stats-top-albums");
+    if (!container) return;
+
+    container.replaceChildren();
+
+    const albums = stats.albums.slice(0, 10);
+
+    if (albums.length === 0) {
+      container.appendChild(
+        createElement("div", "stats-empty", "No albums found for this period.")
+      );
+      return;
+    }
+
+    albums.forEach((album) => {
+      const row = createElement("div", "stats-album-row");
+
+      const identity = createElement("div", "stats-album-identity");
+      const coverWrap = createElement("div", "stats-album-cover-wrap");
+
+      const cover = createElement("img", "stats-album-cover");
+      cover.alt = `${album.name} album cover`;
+      cover.loading = "lazy";
+      cover.dataset.albumKey = getAlbumKey(album);
+      cover.hidden = true;
+
+      const placeholder = createElement(
+        "span",
+        "stats-album-cover-placeholder",
+        "♪"
+      );
+      placeholder.setAttribute("aria-hidden", "true");
+
+      cover.addEventListener("error", () => {
+        const fallback = createElement(
+          "span",
+          "stats-album-cover-placeholder",
+          "♪"
+        );
+        fallback.setAttribute("aria-hidden", "true");
+        cover.replaceWith(fallback);
+        albumCoverCache.set(getAlbumKey(album), null);
+      }, { once: true });
+
+      coverWrap.append(cover, placeholder);
+
+      const info = createElement("div", "stats-album-info");
+      info.append(
+        createElement("div", "stats-album-name", album.name),
+        createElement("div", "stats-album-artist", album.artistName)
+      );
+
+      identity.append(coverWrap, info);
+
+      // Spotify track URI is retained on album aggregation records.
+      const rowStats = createElement(
+        "span",
+        "stats-album-count",
+        `${formatNumber(album.plays)} plays`
+      );
+
+      row.append(identity, rowStats);
+      container.appendChild(row);
+    });
+  }
+
+  // --------------------------------------------------
+  // Monthly activity chart
+  // --------------------------------------------------
+
+  function renderMonthlyActivity() {
+    const container = document.getElementById("stats-monthly-chart");
+    if (!container) return;
+
+    container.replaceChildren();
+
+    const activity = getMonthlyActivity(dashboardRecords);
+
+    if (activity.length === 0) {
+      container.appendChild(
+        createElement("div", "stats-empty", "No monthly activity found.")
+      );
+      return;
+    }
+
+    const maxPlays = Math.max(...activity.map((item) => item[1]), 1);
+
+    activity.forEach(([key, plays]) => {
+      const [year, month] = key.split("-").map(Number);
+      const date = new Date(year, month - 1, 1);
+
       const column = createElement("div", "stats-chart-column");
       const barWrap = createElement("div", "stats-chart-bar-wrap");
       const bar = createElement("div", "stats-chart-bar");
 
-      bar.style.height = `${Math.max(3, (values[index] / maximum) * 100)}%`;
-      bar.title = formatDuration(values[index]);
-
-      const label = createElement(
-        "div",
-        "stats-chart-month",
-        dates[index].toLocaleDateString(undefined, { weekday: "short" })
-      );
+      bar.style.height = `${Math.max(3, (plays / maxPlays) * 100)}%`;
+      bar.title = `${formatNumber(plays)} plays`;
 
       barWrap.appendChild(bar);
+
+      const label = createElement(
+        "span",
+        "stats-chart-month",
+        date.toLocaleDateString(undefined, { month: "short" })
+      );
+
       column.append(barWrap, label);
-      chart.appendChild(column);
-    }
+      container.appendChild(column);
+    });
   }
 
   // --------------------------------------------------
-  // Dashboard construction
+  // Artist details modal
   // --------------------------------------------------
 
-  function buildDashboard() {
-    addDashboardStyles();
+  function createArtistModal() {
+    if (document.getElementById("stats-artist-modal")) return;
 
-const uploadSection = document.querySelector(".upload-section");
+    const modal = createElement("div", "stats-modal");
+    modal.id = "stats-artist-modal";
+    modal.hidden = true;
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-labelledby", "stats-modal-title");
 
-const uploadContainer =
-  uploadSection?.parentElement ||
-  document.querySelector(".page-shell") ||
-  document.querySelector("main") ||
-  document.body;
+    const content = createElement("div", "stats-modal-content");
 
-    const dashboard = createElement("section", "stats-dashboard");
-    dashboard.innerHTML = `
-      <div class="stats-topbar">
-        <div>
-          <div class="stats-eyebrow">YOUR LISTENING HISTORY</div>
-          <h1>Spotify <span>Stats</span></h1>
-          <p>Your listening habits, organized.</p>
-        </div>
-        <button type="button" class="stats-back-button" id="stats-back-button">
-          ← Upload another file
-        </button>
-      </div>
+    const header = createElement("div", "stats-modal-header");
+    const titleArea = createElement("div");
 
-      <div class="stats-period" role="group" aria-label="Listening period">
-        <button type="button" class="stats-period-button active" data-period="all">All Time</button>
-        <button type="button" class="stats-period-button" data-period="year">Past Year</button>
-        <button type="button" class="stats-period-button" data-period="month">Past Month</button>
-      </div>
+    const title = createElement("h2");
+    title.id = "stats-modal-title";
 
-      <div class="stats-grid">
-        <div class="stats-card">
-          <span class="stats-card-label">TOTAL PLAYS</span>
-          <strong class="stats-card-value" id="stats-total-plays">0</strong>
-          <span class="stats-card-note">Recorded listening sessions</span>
-        </div>
+    const subtitle = createElement("div", "stats-modal-subtitle");
+    subtitle.id = "stats-modal-subtitle";
 
-        <div class="stats-card">
-          <span class="stats-card-label">LISTENING TIME</span>
-          <strong class="stats-card-value" id="stats-total-minutes">0 min</strong>
-          <span class="stats-card-note">Total time spent listening</span>
-        </div>
+    titleArea.append(title, subtitle);
 
-        <div class="stats-card">
-          <span class="stats-card-label">UNIQUE SONGS</span>
-          <strong class="stats-card-value" id="stats-unique-tracks">0</strong>
-          <span class="stats-card-note">Distinct songs played</span>
-        </div>
+    const close = createElement("button", "stats-modal-close", "×");
+    close.type = "button";
+    close.setAttribute("aria-label", "Close artist details");
+    close.addEventListener("click", closeArtistModal);
 
-        <div class="stats-card">
-          <span class="stats-card-label">UNIQUE ARTISTS</span>
-          <strong class="stats-card-value" id="stats-unique-artists">0</strong>
-          <span class="stats-card-note">Different artists listened to</span>
-        </div>
-      </div>
+    header.append(titleArea, close);
 
-      <section class="stats-section">
-        <div class="stats-section-heading">
-          <h2>Top Artists</h2>
-          <span class="stats-section-label">BY PLAYS</span>
-        </div>
-        <div class="stats-panel">
-          <div class="stats-artist-list" id="stats-artist-list"></div>
-          <div class="stats-metadata-status" id="stats-metadata-status">
-            Artist images load automatically.
-          </div>
-        </div>
-      </section>
+    const metrics = createElement("div", "stats-modal-metrics");
+    metrics.id = "stats-modal-metrics";
 
-      <section class="stats-section">
-        <div class="stats-section-heading">
-          <h2>Top Albums</h2>
-          <span class="stats-section-label">BY PLAYS</span>
-        </div>
-        <div class="stats-panel">
-          <div class="stats-album-list" id="stats-album-list"></div>
-        </div>
-      </section>
+    const songsHeading = createElement("h3", "", "MOST PLAYED SONGS");
+    const songs = createElement("div", "stats-modal-list");
+    songs.id = "stats-modal-songs";
 
-      <section class="stats-section">
-        <div class="stats-section-heading">
-          <h2>Listening Activity</h2>
-          <span class="stats-section-label">LAST 7 DAYS</span>
-        </div>
-        <div class="stats-panel">
-          <div class="stats-chart" id="stats-listening-chart"></div>
-        </div>
-      </section>
-    `;
+    const albumsHeading = createElement("h3", "", "TOP ALBUMS");
+    const albums = createElement("div", "stats-modal-list");
+    albums.id = "stats-modal-albums";
 
-    uploadContainer.appendChild(dashboard);
+    content.append(
+      header,
+      metrics,
+      songsHeading,
+      songs,
+      albumsHeading,
+      albums
+    );
 
-    const periodButtons = dashboard.querySelectorAll(".stats-period-button");
+    modal.appendChild(content);
 
-    periodButtons.forEach((button) => {
-      button.addEventListener("click", () => {
-        selectedPeriod = button.dataset.period;
-
-        periodButtons.forEach((periodButton) => {
-          periodButton.classList.toggle(
-            "active",
-            periodButton === button
-          );
-        });
-
-        renderDashboard();
-      });
+    modal.addEventListener("click", (event) => {
+      if (event.target === modal) closeArtistModal();
     });
 
-    const backButton = dashboard.querySelector("#stats-back-button");
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && !modal.hidden) {
+        closeArtistModal();
+      }
+    });
 
-    if (backButton) {
-      backButton.addEventListener("click", () => {
-        restoreUploadView();
+    document.body.appendChild(modal);
+  }
+
+  function openArtistModal(artistName) {
+    const modal = document.getElementById("stats-artist-modal");
+    if (!modal) return;
+
+    const stats = calculateStatistics(getFilteredRecords());
+
+    const artist = stats.artists.find(
+      (item) => normalize(item.name) === normalize(artistName)
+    );
+
+    if (!artist) return;
+
+    document.getElementById("stats-modal-title").textContent = artist.name;
+
+    document.getElementById("stats-modal-subtitle").textContent =
+      selectedPeriod === "month"
+        ? "Personal listening statistics · Past 30 days"
+        : selectedPeriod === "year"
+          ? "Personal listening statistics · Past 365 days"
+          : "Personal listening statistics · All time";
+
+    const totalDuration = artist.duration;
+    const share = stats.totalDuration > 0
+      ? ((totalDuration / stats.totalDuration) * 100).toFixed(1)
+      : "0.0";
+
+    const metrics = document.getElementById("stats-modal-metrics");
+    metrics.replaceChildren();
+
+    [
+      ["PLAYS", formatNumber(artist.plays)],
+      ["UNIQUE SONGS", formatNumber(artist.tracks.size)],
+      ["LISTENING SHARE", `${share}%`]
+    ].forEach(([label, value]) => {
+      const metric = createElement("div", "stats-modal-metric");
+      metric.append(
+        createElement("strong", "", value),
+        createElement("span", "", label)
+      );
+      metrics.appendChild(metric);
+    });
+
+    const songs = document.getElementById("stats-modal-songs");
+    songs.replaceChildren();
+
+    const topTracks = [...artist.tracks.values()]
+      .sort((a, b) => b.plays - a.plays)
+      .slice(0, 10);
+
+    if (topTracks.length === 0) {
+      songs.appendChild(
+        createElement("div", "stats-empty", "No songs found.")
+      );
+    } else {
+      topTracks.forEach((track) => {
+        songs.appendChild(
+          createModalListItem(track.name, `${formatNumber(track.plays)} plays`)
+        );
       });
     }
 
-    // Move the full privacy disclosure below the dashboard content.
-    if (privacyCard) {
-      privacyCard.hidden = false;
-      dashboard.appendChild(privacyCard);
+    const albums = document.getElementById("stats-modal-albums");
+    albums.replaceChildren();
+
+    const topAlbums = [...artist.albums.values()]
+      .sort((a, b) => b.plays - a.plays)
+      .slice(0, 10);
+
+    if (topAlbums.length === 0) {
+      albums.appendChild(
+        createElement("div", "stats-empty", "No album information found.")
+      );
+    } else {
+      topAlbums.forEach((album) => {
+        albums.appendChild(
+          createModalListItem(album.name, `${formatNumber(album.plays)} plays`)
+        );
+      });
     }
 
-    renderDashboard();
+    modal.hidden = false;
+    document.body.style.overflow = "hidden";
+  }
+
+  function createModalListItem(name, value) {
+    const item = createElement("div", "stats-modal-list-item");
+
+    item.append(
+      createElement("span", "", name),
+      createElement("span", "", value)
+    );
+
+    return item;
+  }
+
+  function closeArtistModal() {
+    const modal = document.getElementById("stats-artist-modal");
+
+    if (modal) modal.hidden = true;
+    document.body.style.overflow = "";
   }
 
   // --------------------------------------------------
-  // Upload and dashboard transitions
+  // Start and return from dashboard
   // --------------------------------------------------
 
-  function restoreUploadView() {
-    const dashboard = document.querySelector(".stats-dashboard");
+  function startStatistics() {
+    if (!currentFile || !isValidated || validatedRecords.length === 0) {
+      return;
+    }
+
+    dashboardRecords = validatedRecords.slice();
+    selectedPeriod = "all";
+
+    // Reset metadata state for the newly imported listening history.
+    artistMetadataCache.clear();
+    artistImageCache.clear();
+    artistMetadataRequests.clear();
+    albumCoverCache.clear();
+    albumCoverRequests.clear();
+
+    metadataLoading = false;
+    albumCoverLoading = false;
+    metadataLoadedCount = 0;
+    metadataTotalCount = 0;
+
+    createDashboard();
+
+    // Release the original upload references after creating the dashboard.
+    validatedRecords = [];
+    currentFile = null;
+    isValidated = false;
+  }
+
+  function returnToUpload() {
+    const dashboard = document.getElementById("stats-dashboard");
+    const modal = document.getElementById("stats-artist-modal");
 
     if (dashboard) dashboard.remove();
+    if (modal) modal.remove();
+
+    const uploadSection = document.querySelector(".upload-section");
+    if (uploadSection) uploadSection.hidden = false;
 
     // Restore the privacy disclosure to its original upload-page position.
     if (privacyCard && privacyCardOriginalParent) {
@@ -1903,63 +2232,41 @@ const uploadContainer =
       } else {
         privacyCardOriginalParent.appendChild(privacyCard);
       }
-
       privacyCard.hidden = false;
     }
 
-    const uploadSection = document.querySelector(".upload-section");
-
-    if (uploadSection) {
-      uploadSection.hidden = false;
-    }
-
-    if (dropZone) dropZone.hidden = false;
-    if (selectedFile) selectedFile.hidden = true;
-    if (processButton) processButton.hidden = false;
-
-    setButtonState(false);
-  }
-
-  function showDashboard() {
-    const uploadSection = document.querySelector(".upload-section");
-
-    if (uploadSection) {
-      uploadSection.hidden = true;
-    }
-
-    if (dropZone) dropZone.hidden = true;
-    if (selectedFile) selectedFile.hidden = true;
-    if (processButton) processButton.hidden = true;
-
-    buildDashboard();
-    loadAllArtistMetadata();
-    loadAllAlbumCovers();
-  }
-
-  // --------------------------------------------------
-  // Process listening history
-  // --------------------------------------------------
-
-  async function processListeningHistory() {
-    if (!isValidated || !validatedRecords.length) {
-      showMessage("Please select and validate your Spotify ZIP file first.");
-      return;
-    }
-
-    dashboardRecords = validatedRecords.slice();
+    dashboardRecords = [];
     selectedPeriod = "all";
 
-    showDashboard();
+    artistMetadataCache.clear();
+    artistImageCache.clear();
+    artistMetadataRequests.clear();
+    albumCoverCache.clear();
+    albumCoverRequests.clear();
+
+    metadataLoading = false;
+    albumCoverLoading = false;
+    metadataLoadedCount = 0;
+    metadataTotalCount = 0;
+
+    resetUpload();
+
+    window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
   if (processButton) {
-    processButton.addEventListener("click", processListeningHistory);
+    processButton.addEventListener("click", startStatistics);
   }
 
   // --------------------------------------------------
-  // Initial page state
+  // Clear imported data when leaving the page
   // --------------------------------------------------
 
-  restoreUploadView();
+  window.addEventListener("pagehide", () => {
+    currentFile = null;
+    validatedRecords = [];
+    dashboardRecords = [];
+    isValidated = false;
+  });
 
 })();
