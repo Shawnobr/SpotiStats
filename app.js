@@ -32,6 +32,7 @@
     "https://spotistats-metadata.shawnfinkle6.workers.dev";
 
   const METADATA_BATCH_SIZE = 10;
+  const ARTIST_IMAGE_BATCH_SIZE = 10;
 
   let currentFile = null;
   let validatedRecords = [];
@@ -54,6 +55,9 @@
   let metadataLoadedCount = 0;
   let metadataTotalCount = 0;
   let artistImagesLoadedCount = 0;
+
+  let metadataStatusMessage = "";
+  let artistImageStatusMessage = "";
 
   // --------------------------------------------------
   // General helpers
@@ -475,19 +479,7 @@
   // --------------------------------------------------
 
   function getUniqueArtistNames() {
-    const names = new Map();
-
-    dashboardRecords.forEach((record) => {
-      const key = normalizeArtistKey(record.artistName);
-
-      if (key && !names.has(key)) {
-        names.set(key, record.artistName);
-      }
-    });
-
-    return [...names.values()].sort(
-      (a, b) => a.localeCompare(b)
-    );
+    return getAllTimeArtists().map((artist) => artist.name);
   }
 
   function getUniqueAlbumNames() {
@@ -693,20 +685,161 @@
     return response.json();
   }
 
-  function updateMetadataStatus(message) {
+  async function fetchArtistImageBatch(names) {
+    const response = await fetch(
+      `${METADATA_API_URL}/api/artist-images`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ names })
+      }
+    );
+
+    if (!response.ok) {
+      const details = await response.text();
+
+      throw new Error(
+        `Artist image request failed: HTTP ${response.status} ${details.slice(0, 250)}`
+      );
+    }
+
+    return response.json();
+  }
+
+  // --------------------------------------------------
+  // Metadata and image loading status
+  // --------------------------------------------------
+
+  function renderMetadataStatus() {
     const status = document.getElementById("stats-metadata-status");
 
-    if (status) {
-      status.textContent = message;
+    if (!status) return;
+
+    const messages = [
+      artistImageStatusMessage,
+      metadataStatusMessage
+    ].filter(Boolean);
+
+    status.textContent = messages.join(" · ");
+  }
+
+  function updateMetadataStatus(message) {
+    metadataStatusMessage = message;
+    renderMetadataStatus();
+  }
+
+  function updateArtistImageStatus(message) {
+    artistImageStatusMessage = message;
+    renderMetadataStatus();
+  }
+
+  // --------------------------------------------------
+  // Fast artist image loading
+  // --------------------------------------------------
+
+  async function loadAllArtistImages() {
+    if (artistImageLoading) return;
+
+    const artists = getAllTimeArtists();
+
+    if (!artists.length) {
+      updateArtistImageStatus("No artist images to load.");
+      return;
+    }
+
+    artistImageLoading = true;
+    artistImagesLoadedCount = 0;
+
+    // calculateStatistics() sorts artists by play count.
+    // The most-listened-to artists are therefore processed first.
+    const names = artists.map((artist) => artist.name);
+
+    // Skip artists that already have an image URL in memory.
+    const uncachedNames = names.filter((name) => {
+      const key = normalizeArtistKey(name);
+
+      return !artistImageCache.has(key);
+    });
+
+    // Count images already available from a previous metadata lookup.
+    artistImagesLoadedCount = names.filter((name) => {
+      return Boolean(getArtistImageUrl(name));
+    }).length;
+
+    updateArtistImageStatus(
+      `Loading artist images · ${formatNumber(artistImagesLoadedCount)} of ${formatNumber(names.length)} ready`
+    );
+
+    try {
+      for (
+        let start = 0;
+        start < uncachedNames.length;
+        start += ARTIST_IMAGE_BATCH_SIZE
+      ) {
+        const batch = uncachedNames.slice(
+          start,
+          start + ARTIST_IMAGE_BATCH_SIZE
+        );
+
+        try {
+          const data = await fetchArtistImageBatch(batch);
+
+          (data.results || []).forEach((result) => {
+            if (!result) return;
+
+            const key = normalizeArtistKey(
+              result.requestedName
+            );
+
+            if (result.success && result.imageUrl && key) {
+              artistImageCache.set(key, result.imageUrl);
+            }
+          });
+
+        } catch (error) {
+          console.warn(
+            "Artist image batch could not be loaded:",
+            error
+          );
+        }
+
+        artistImagesLoadedCount = names.filter((name) => {
+          return Boolean(getArtistImageUrl(name));
+        }).length;
+
+        // Update visible artist rows immediately after each batch.
+        refreshArtistImages();
+
+        updateArtistImageStatus(
+          `Loading artist images · ${formatNumber(artistImagesLoadedCount)} of ${formatNumber(names.length)} ready`
+        );
+      }
+
+      artistImagesLoadedCount = names.filter((name) => {
+        return Boolean(getArtistImageUrl(name));
+      }).length;
+
+      updateArtistImageStatus(
+        `Artist images ready · ${formatNumber(artistImagesLoadedCount)} of ${formatNumber(names.length)} found`
+      );
+
+      refreshArtistImages();
+
+    } finally {
+      artistImageLoading = false;
     }
   }
+
+  // --------------------------------------------------
+  // Extended artist metadata loading
+  // --------------------------------------------------
 
   async function loadAllArtistMetadata() {
     if (metadataLoading) return;
 
-    // getAllTimeArtists() is already sorted by play count.
-    // This means the most-listened-to artists are processed first.
-    const names = getAllTimeArtists().map((artist) => artist.name);
+    const names = getUniqueArtistNames();
 
     metadataTotalCount = names.length;
     metadataLoadedCount = 0;
@@ -728,14 +861,13 @@
       );
 
       refreshArtistImages();
-      await loadAllArtistImages();
       return;
     }
 
     metadataLoading = true;
 
     updateMetadataStatus(
-      `Loading artist metadata · 0 of ${formatNumber(names.length)}`
+      `Loading extended metadata · 0 of ${formatNumber(names.length)}`
     );
 
     try {
@@ -793,7 +925,7 @@
         );
 
         updateMetadataStatus(
-          `Loading artist metadata · ${formatNumber(metadataLoadedCount)} of ${formatNumber(names.length)}`
+          `Loading extended metadata · ${formatNumber(metadataLoadedCount)} of ${formatNumber(names.length)}`
         );
 
         refreshArtistImages();
@@ -804,22 +936,16 @@
       ).length;
 
       updateMetadataStatus(
-        `Artist metadata ready · ${formatNumber(foundCount)} of ${formatNumber(names.length)} artists matched`
+        `Extended metadata ready · ${formatNumber(foundCount)} of ${formatNumber(names.length)} artists matched`
       );
 
       refreshArtistImages();
-
-      await loadAllArtistImages();
-
-      updateMetadataStatus(
-        `Artist images loaded · ${formatNumber(artistImagesLoadedCount)} of ${formatNumber(names.length)} artists`
-      );
 
     } catch (error) {
       console.error("Artist metadata loading failed:", error);
 
       updateMetadataStatus(
-        "Artist metadata could not finish loading. Reload the page to try again."
+        "Extended artist metadata could not finish loading."
       );
 
     } finally {
@@ -973,6 +1099,7 @@
 
       if (!albums.length) return;
 
+      // Most-listened-to albums are already sorted first.
       const prioritized = albums.slice(0, 10);
       const remaining = albums.slice(10);
 
@@ -982,6 +1109,7 @@
         }
       };
 
+      // Load the top ten first, then the remaining albums.
       await loadGroup(prioritized);
       await loadGroup(remaining);
 
@@ -991,10 +1119,18 @@
   }
 
   // --------------------------------------------------
-  // Artist image rendering and background preloading
+  // Artist image rendering
   // --------------------------------------------------
 
   function getArtistImageUrl(name) {
+    const key = normalizeArtistKey(name);
+
+    // The fast Spotify image endpoint takes priority.
+    const cachedImage = artistImageCache.get(key);
+
+    if (cachedImage) return cachedImage;
+
+    // Fall back to the image returned by extended metadata.
     const metadata = getArtistMetadata(name);
 
     if (!metadata) return null;
@@ -1002,7 +1138,6 @@
     return (
       metadata.images?.spotifyArtistImage ||
       metadata.images?.artistThumb ||
-      artistImageCache.get(normalizeArtistKey(name)) ||
       null
     );
   }
@@ -1012,111 +1147,29 @@
       const name = image.dataset.artistImage;
       const imageUrl = getArtistImageUrl(name);
 
-      if (!imageUrl || image.src === imageUrl) return;
-
-      image.src = imageUrl;
-      image.hidden = false;
-
       const placeholder =
         image.parentElement?.querySelector(
           ".stats-artist-image-placeholder"
         );
 
+      if (!imageUrl) {
+        image.hidden = true;
+
+        if (placeholder) placeholder.hidden = false;
+
+        return;
+      }
+
+      if (image.dataset.loadedUrl === imageUrl) {
+        return;
+      }
+
+      image.dataset.loadedUrl = imageUrl;
+      image.src = imageUrl;
+      image.hidden = false;
+
       if (placeholder) placeholder.hidden = true;
     });
-  }
-
-  function getAllTimeArtists() {
-    const stats = calculateStatistics(dashboardRecords);
-
-    return stats.artists;
-  }
-
-  async function loadArtistImageForArtist(name) {
-    const metadata = getArtistMetadata(name);
-
-    if (!metadata) return false;
-
-    const imageUrl = getArtistImageUrl(name);
-
-    if (!imageUrl) return false;
-
-    const key = normalizeArtistKey(name);
-
-    artistImageCache.set(key, imageUrl);
-
-    // Preload the image even when the artist is not currently visible.
-    // This also allows the browser to reuse the downloaded image later.
-    return new Promise((resolve) => {
-      const preload = new Image();
-
-      preload.onload = () => {
-        const image = document.querySelector(
-          `[data-artist-image="${CSS.escape(name)}"]`
-        );
-
-        if (image) {
-          image.src = imageUrl;
-          image.hidden = false;
-
-          const placeholder =
-            image.parentElement?.querySelector(
-              ".stats-artist-image-placeholder"
-            );
-
-          if (placeholder) placeholder.hidden = true;
-        }
-
-        resolve(true);
-      };
-
-      preload.onerror = () => {
-        console.warn(`Artist image unavailable for ${name}`);
-        resolve(false);
-      };
-
-      preload.src = imageUrl;
-    });
-  }
-
-  async function loadAllArtistImages() {
-    if (artistImageLoading) return;
-
-    const artists = getAllTimeArtists();
-
-    if (!artists.length) return;
-
-    artistImageLoading = true;
-    artistImagesLoadedCount = 0;
-
-    // Artists are sorted by all-time plays, highest first.
-    const prioritized = artists.slice(0, 10);
-    const remaining = artists.slice(10);
-
-    const loadGroup = async (group) => {
-      for (const artist of group) {
-        const loaded = await loadArtistImageForArtist(artist.name);
-
-        if (loaded) {
-          artistImagesLoadedCount++;
-        }
-
-        updateMetadataStatus(
-          `Loading artist images · ${formatNumber(artistImagesLoadedCount)} loaded · ${formatNumber(artists.length)} artists`
-        );
-      }
-    };
-
-    try {
-      // Load the ten most-listened-to artists first.
-      await loadGroup(prioritized);
-
-      // Then load all remaining artists sequentially.
-      await loadGroup(remaining);
-
-    } finally {
-      artistImageLoading = false;
-    }
   }
 
   // --------------------------------------------------
@@ -1852,7 +1905,7 @@
     const metadataStatus = createElement(
       "div",
       "stats-metadata-status",
-      "Preparing artist metadata..."
+      "Preparing artist images and metadata..."
     );
 
     metadataStatus.id = "stats-metadata-status";
@@ -1888,6 +1941,11 @@
     renderDashboard();
     createArtistModal();
 
+    // Start the three metadata tasks independently.
+    // Artist images use the fast Spotify-only endpoint.
+    // Extended metadata runs in the background.
+    // Album artwork retains its existing oEmbed endpoint.
+    loadAllArtistImages();
     loadAllArtistMetadata();
     loadAllAlbumCovers();
   }
@@ -2012,8 +2070,10 @@
 
       image.addEventListener("error", () => {
         image.hidden = true;
+        image.dataset.loadedUrl = "";
+
         placeholder.hidden = false;
-      }, { once: true });
+      });
 
       imageWrap.append(image, placeholder);
 
@@ -2487,6 +2547,9 @@
     metadataTotalCount = 0;
     artistImagesLoadedCount = 0;
 
+    metadataStatusMessage = "";
+    artistImageStatusMessage = "";
+
     try {
       createDashboard();
 
@@ -2549,6 +2612,9 @@
     metadataLoadedCount = 0;
     metadataTotalCount = 0;
     artistImagesLoadedCount = 0;
+
+    metadataStatusMessage = "";
+    artistImageStatusMessage = "";
 
     resetUpload();
 
