@@ -32,7 +32,7 @@
     "https://spotistats-metadata.shawnfinkle6.workers.dev";
 
   const METADATA_BATCH_SIZE = 10;
-  const ARTIST_IMAGE_BATCH_SIZE = 10;
+  const ARTIST_SEARCH_RESULT_LIMIT = 10;
 
   let currentFile = null;
   let validatedRecords = [];
@@ -44,6 +44,7 @@
   const artistMetadataCache = new Map();
   const artistMetadataRequests = new Map();
   const artistImageCache = new Map();
+  const artistImageRequests = new Map();
 
   const albumCoverCache = new Map();
   const albumCoverRequests = new Map();
@@ -55,9 +56,6 @@
   let metadataLoadedCount = 0;
   let metadataTotalCount = 0;
   let artistImagesLoadedCount = 0;
-
-  let metadataStatusMessage = "";
-  let artistImageStatusMessage = "";
 
   // --------------------------------------------------
   // General helpers
@@ -660,7 +658,7 @@
       record.images?.artistThumb ||
       null;
 
-    if (imageUrl) {
+    if (imageUrl && !artistImageCache.has(key)) {
       artistImageCache.set(key, imageUrl);
     }
   }
@@ -685,7 +683,7 @@
     return response.json();
   }
 
-  async function fetchArtistImageBatch(names) {
+  async function fetchArtistImagesBatch(names) {
     const response = await fetch(
       `${METADATA_API_URL}/api/artist-images`,
       {
@@ -708,144 +706,23 @@
     return response.json();
   }
 
-  // --------------------------------------------------
-  // Metadata and image loading status
-  // --------------------------------------------------
-
-  function renderMetadataStatus() {
+  function updateMetadataStatus(message) {
     const status = document.getElementById("stats-metadata-status");
 
-    if (!status) return;
-
-    const messages = [
-      artistImageStatusMessage,
-      metadataStatusMessage
-    ].filter(Boolean);
-
-    status.textContent = messages.join(" · ");
-  }
-
-  function updateMetadataStatus(message) {
-    metadataStatusMessage = message;
-    renderMetadataStatus();
-  }
-
-  function updateArtistImageStatus(message) {
-    artistImageStatusMessage = message;
-    renderMetadataStatus();
-  }
-
-  // --------------------------------------------------
-  // Fast artist image loading
-  // --------------------------------------------------
-
-  async function loadAllArtistImages() {
-    if (artistImageLoading) return;
-
-    const artists = getAllTimeArtists();
-
-    if (!artists.length) {
-      updateArtistImageStatus("No artist images to load.");
-      return;
-    }
-
-    artistImageLoading = true;
-    artistImagesLoadedCount = 0;
-
-    // calculateStatistics() sorts artists by play count.
-    // The most-listened-to artists are therefore processed first.
-    const names = artists.map((artist) => artist.name);
-
-    // Skip artists that already have an image URL in memory.
-    const uncachedNames = names.filter((name) => {
-      const key = normalizeArtistKey(name);
-
-      return !artistImageCache.has(key);
-    });
-
-    // Count images already available from a previous metadata lookup.
-    artistImagesLoadedCount = names.filter((name) => {
-      return Boolean(getArtistImageUrl(name));
-    }).length;
-
-    updateArtistImageStatus(
-      `Loading artist images · ${formatNumber(artistImagesLoadedCount)} of ${formatNumber(names.length)} ready`
-    );
-
-    try {
-      for (
-        let start = 0;
-        start < uncachedNames.length;
-        start += ARTIST_IMAGE_BATCH_SIZE
-      ) {
-        const batch = uncachedNames.slice(
-          start,
-          start + ARTIST_IMAGE_BATCH_SIZE
-        );
-
-        try {
-          const data = await fetchArtistImageBatch(batch);
-
-          (data.results || []).forEach((result) => {
-            if (!result) return;
-
-            const key = normalizeArtistKey(
-              result.requestedName
-            );
-
-            if (result.success && result.imageUrl && key) {
-              artistImageCache.set(key, result.imageUrl);
-            }
-          });
-
-        } catch (error) {
-          console.warn(
-            "Artist image batch could not be loaded:",
-            error
-          );
-        }
-
-        artistImagesLoadedCount = names.filter((name) => {
-          return Boolean(getArtistImageUrl(name));
-        }).length;
-
-        // Update visible artist rows immediately after each batch.
-        refreshArtistImages();
-
-        updateArtistImageStatus(
-          `Loading artist images · ${formatNumber(artistImagesLoadedCount)} of ${formatNumber(names.length)} ready`
-        );
-      }
-
-      artistImagesLoadedCount = names.filter((name) => {
-        return Boolean(getArtistImageUrl(name));
-      }).length;
-
-      updateArtistImageStatus(
-        `Artist images ready · ${formatNumber(artistImagesLoadedCount)} of ${formatNumber(names.length)} found`
-      );
-
-      refreshArtistImages();
-
-    } finally {
-      artistImageLoading = false;
+    if (status) {
+      status.textContent = message;
     }
   }
-
-  // --------------------------------------------------
-  // Extended artist metadata loading
-  // --------------------------------------------------
 
   async function loadAllArtistMetadata() {
     if (metadataLoading) return;
 
-    const names = getUniqueArtistNames();
+    const names = getAllTimeArtists().map((artist) => artist.name);
 
     metadataTotalCount = names.length;
     metadataLoadedCount = 0;
 
     if (names.length === 0) {
-      updateMetadataStatus("No artist metadata to load.");
       return;
     }
 
@@ -856,19 +733,11 @@
     if (uncachedNames.length === 0) {
       metadataLoadedCount = names.length;
 
-      updateMetadataStatus(
-        `Artist metadata ready · ${formatNumber(names.length)} artists`
-      );
-
       refreshArtistImages();
       return;
     }
 
     metadataLoading = true;
-
-    updateMetadataStatus(
-      `Loading extended metadata · 0 of ${formatNumber(names.length)}`
-    );
 
     try {
       for (
@@ -924,10 +793,6 @@
           metadataLoadedCount + batch.length
         );
 
-        updateMetadataStatus(
-          `Loading extended metadata · ${formatNumber(metadataLoadedCount)} of ${formatNumber(names.length)}`
-        );
-
         refreshArtistImages();
       }
 
@@ -935,18 +800,12 @@
         (name) => getArtistMetadata(name)
       ).length;
 
-      updateMetadataStatus(
-        `Extended metadata ready · ${formatNumber(foundCount)} of ${formatNumber(names.length)} artists matched`
+      console.info(
+        `Artist metadata loaded: ${foundCount} of ${names.length}`
       );
-
-      refreshArtistImages();
 
     } catch (error) {
       console.error("Artist metadata loading failed:", error);
-
-      updateMetadataStatus(
-        "Extended artist metadata could not finish loading."
-      );
 
     } finally {
       metadataLoading = false;
@@ -1099,7 +958,6 @@
 
       if (!albums.length) return;
 
-      // Most-listened-to albums are already sorted first.
       const prioritized = albums.slice(0, 10);
       const remaining = albums.slice(10);
 
@@ -1109,7 +967,6 @@
         }
       };
 
-      // Load the top ten first, then the remaining albums.
       await loadGroup(prioritized);
       await loadGroup(remaining);
 
@@ -1119,25 +976,16 @@
   }
 
   // --------------------------------------------------
-  // Artist image rendering
+  // Artist image rendering and background preloading
   // --------------------------------------------------
 
   function getArtistImageUrl(name) {
     const key = normalizeArtistKey(name);
 
-    // The fast Spotify image endpoint takes priority.
-    const cachedImage = artistImageCache.get(key);
-
-    if (cachedImage) return cachedImage;
-
-    // Fall back to the image returned by extended metadata.
-    const metadata = getArtistMetadata(name);
-
-    if (!metadata) return null;
-
     return (
-      metadata.images?.spotifyArtistImage ||
-      metadata.images?.artistThumb ||
+      artistImageCache.get(key) ||
+      getArtistMetadata(name)?.images?.spotifyArtistImage ||
+      getArtistMetadata(name)?.images?.artistThumb ||
       null
     );
   }
@@ -1147,29 +995,125 @@
       const name = image.dataset.artistImage;
       const imageUrl = getArtistImageUrl(name);
 
+      if (!imageUrl || image.dataset.currentImageUrl === imageUrl) {
+        return;
+      }
+
+      image.dataset.currentImageUrl = imageUrl;
+      image.src = imageUrl;
+      image.hidden = false;
+
       const placeholder =
         image.parentElement?.querySelector(
           ".stats-artist-image-placeholder"
         );
 
-      if (!imageUrl) {
-        image.hidden = true;
-
-        if (placeholder) placeholder.hidden = false;
-
-        return;
-      }
-
-      if (image.dataset.loadedUrl === imageUrl) {
-        return;
-      }
-
-      image.dataset.loadedUrl = imageUrl;
-      image.src = imageUrl;
-      image.hidden = false;
-
       if (placeholder) placeholder.hidden = true;
     });
+  }
+
+  function getAllTimeArtists() {
+    const stats = calculateStatistics(dashboardRecords);
+
+    return stats.artists;
+  }
+
+  async function loadArtistImageForArtist(name) {
+    const key = normalizeArtistKey(name);
+
+    if (artistImageCache.has(key)) {
+      return Boolean(artistImageCache.get(key));
+    }
+
+    if (artistImageRequests.has(key)) {
+      return artistImageRequests.get(key);
+    }
+
+    const metadataImage =
+      getArtistMetadata(name)?.images?.spotifyArtistImage ||
+      getArtistMetadata(name)?.images?.artistThumb ||
+      null;
+
+    if (metadataImage) {
+      artistImageCache.set(key, metadataImage);
+      refreshArtistImages();
+      return true;
+    }
+
+    return false;
+  }
+
+  async function loadAllArtistImages() {
+    if (artistImageLoading) return;
+
+    const artists = getAllTimeArtists();
+
+    if (!artists.length) return;
+
+    artistImageLoading = true;
+    artistImagesLoadedCount = 0;
+
+    // The statistics calculation sorts artists by play count.
+    // The most-listened-to artists are therefore requested first.
+    const names = artists.map((artist) => artist.name);
+
+    const uncachedNames = names.filter((name) => {
+      const key = normalizeArtistKey(name);
+
+      return !artistImageCache.has(key);
+    });
+
+    try {
+      for (
+        let start = 0;
+        start < uncachedNames.length;
+        start += METADATA_BATCH_SIZE
+      ) {
+        const batch = uncachedNames.slice(
+          start,
+          start + METADATA_BATCH_SIZE
+        );
+
+        try {
+          const data = await fetchArtistImagesBatch(batch);
+
+          (data.results || []).forEach((result) => {
+            if (!result || !result.requestedName) return;
+
+            const key = normalizeArtistKey(result.requestedName);
+
+            if (result.success && result.imageUrl) {
+              artistImageCache.set(key, result.imageUrl);
+              artistImagesLoadedCount++;
+            }
+          });
+
+          // Show each completed batch immediately.
+          refreshArtistImages();
+
+        } catch (error) {
+          console.warn("Artist image batch failed:", error);
+        }
+
+        const completed = Math.min(
+          start + batch.length,
+          uncachedNames.length
+        );
+
+        updateMetadataStatus(
+          `Loading artist images · ${formatNumber(artistImagesLoadedCount)} found · ${formatNumber(completed)} of ${formatNumber(uncachedNames.length)} checked`
+        );
+      }
+
+      refreshArtistImages();
+
+      updateMetadataStatus(
+        `Artist images ready · ${formatNumber(artistImagesLoadedCount)} of ${formatNumber(names.length)} artists`
+      );
+
+    } finally {
+      artistImageLoading = false;
+    }
   }
 
   // --------------------------------------------------
@@ -1332,6 +1276,130 @@
         margin-top: 5px;
         color: #70786e;
         font-size: 10px;
+      }
+
+      .stats-artist-search-panel {
+        margin-bottom: 14px;
+        padding: 22px;
+        border: 1px solid rgba(255,255,255,0.085);
+        border-radius: 9px;
+        background: rgba(255,255,255,0.025);
+      }
+
+      .stats-artist-search-heading {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 17px;
+      }
+
+      .stats-artist-search-title {
+        margin: 0;
+        color: #f1f3ed;
+        font-family: "Manrope", sans-serif;
+        font-size: 14px;
+        font-weight: 700;
+      }
+
+      .stats-artist-search-kicker {
+        color: #777f74;
+        font-family: "DM Mono", monospace;
+        font-size: 9px;
+        letter-spacing: 0.08em;
+      }
+
+      .stats-artist-search-wrap {
+        position: relative;
+      }
+
+      .stats-artist-search-input {
+        display: block;
+        width: 100%;
+        min-height: 43px;
+        padding: 0 14px 0 40px;
+        border: 1px solid rgba(255,255,255,0.11);
+        border-radius: 7px;
+        outline: none;
+        background: rgba(0,0,0,0.16);
+        color: #f1f3ed;
+        font: inherit;
+        font-size: 12px;
+        transition: border-color 0.2s ease, background 0.2s ease;
+      }
+
+      .stats-artist-search-input::placeholder {
+        color: #727b6f;
+      }
+
+      .stats-artist-search-input:focus {
+        border-color: rgba(213,251,98,0.5);
+        background: rgba(0,0,0,0.24);
+      }
+
+      .stats-artist-search-icon {
+        position: absolute;
+        top: 50%;
+        left: 14px;
+        transform: translateY(-50%);
+        color: #858e7d;
+        font-size: 15px;
+        pointer-events: none;
+      }
+
+      .stats-artist-search-results {
+        display: flex;
+        flex-direction: column;
+        gap: 5px;
+        margin-top: 10px;
+      }
+
+      .stats-artist-search-results:empty {
+        display: none;
+      }
+
+      .stats-artist-search-result {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        width: 100%;
+        min-width: 0;
+        padding: 11px 12px;
+        border: 1px solid transparent;
+        border-radius: 6px;
+        background: rgba(255,255,255,0.018);
+        color: #e7eadf;
+        text-align: left;
+        cursor: pointer;
+        transition: 0.18s ease;
+      }
+
+      .stats-artist-search-result:hover {
+        border-color: rgba(213,251,98,0.2);
+        background: rgba(213,251,98,0.045);
+      }
+
+      .stats-artist-search-result-name {
+        overflow: hidden;
+        font-size: 11px;
+        font-weight: 650;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .stats-artist-search-result-plays {
+        flex-shrink: 0;
+        color: #858e7d;
+        font-family: "DM Mono", monospace;
+        font-size: 9px;
+      }
+
+      .stats-artist-search-hint {
+        padding: 13px 2px 2px;
+        color: #737c70;
+        font-size: 10px;
+        line-height: 1.6;
       }
 
       .stats-dashboard-grid {
@@ -1532,47 +1600,6 @@
         font-size: 9px;
       }
 
-      .stats-chart {
-        display: flex;
-        align-items: stretch;
-        gap: 8px;
-        height: 190px;
-        padding-top: 10px;
-      }
-
-      .stats-chart-column {
-        display: flex;
-        flex: 1;
-        flex-direction: column;
-        align-items: center;
-        justify-content: flex-end;
-        min-width: 0;
-        gap: 8px;
-      }
-
-      .stats-chart-bar-wrap {
-        display: flex;
-        align-items: flex-end;
-        justify-content: center;
-        width: 100%;
-        height: 150px;
-      }
-
-      .stats-chart-bar {
-        width: min(100%, 28px);
-        min-height: 3px;
-        border-radius: 4px 4px 1px 1px;
-        background: #d5fb62;
-        opacity: 0.85;
-        transition: height 0.3s ease;
-      }
-
-      .stats-chart-month {
-        color: #737c70;
-        font-family: "DM Mono", monospace;
-        font-size: 8px;
-      }
-
       .stats-empty {
         padding: 24px 10px;
         color: #747d70;
@@ -1746,7 +1773,8 @@
           padding-inline: 7px;
         }
 
-        .stats-panel {
+        .stats-panel,
+        .stats-artist-search-panel {
           padding: 17px;
         }
 
@@ -1754,12 +1782,14 @@
           padding: 15px;
         }
 
-        .stats-chart {
-          gap: 4px;
-        }
-
         .stats-modal-content {
           padding: 19px;
+        }
+
+        .stats-artist-search-heading {
+          align-items: flex-start;
+          flex-direction: column;
+          gap: 7px;
         }
       }
     `;
@@ -1865,6 +1895,86 @@
     const metrics = createElement("div", "stats-metrics-grid");
     metrics.id = "stats-metrics-grid";
 
+    // Artist Search block
+    const artistSearchPanel = createElement(
+      "section",
+      "stats-artist-search-panel"
+    );
+
+    const artistSearchHeading = createElement(
+      "div",
+      "stats-artist-search-heading"
+    );
+
+    artistSearchHeading.append(
+      createElement(
+        "h2",
+        "stats-artist-search-title",
+        "Artist Search"
+      ),
+      createElement(
+        "span",
+        "stats-artist-search-kicker",
+        "YOUR LISTENING HISTORY"
+      )
+    );
+
+    const artistSearchWrap = createElement(
+      "div",
+      "stats-artist-search-wrap"
+    );
+
+    const artistSearchIcon = createElement(
+      "span",
+      "stats-artist-search-icon",
+      "⌕"
+    );
+
+    artistSearchIcon.setAttribute("aria-hidden", "true");
+
+    const artistSearchInput = createElement(
+      "input",
+      "stats-artist-search-input"
+    );
+
+    artistSearchInput.type = "search";
+    artistSearchInput.id = "stats-artist-search-input";
+    artistSearchInput.placeholder = "Search for an artist...";
+    artistSearchInput.autocomplete = "off";
+    artistSearchInput.setAttribute(
+      "aria-label",
+      "Search artists in your listening history"
+    );
+
+    const artistSearchResults = createElement(
+      "div",
+      "stats-artist-search-results"
+    );
+
+    artistSearchResults.id = "stats-artist-search-results";
+
+    artistSearchResults.setAttribute("aria-live", "polite");
+
+    artistSearchInput.addEventListener("input", () => {
+      renderArtistSearchResults(artistSearchInput.value);
+    });
+
+    artistSearchWrap.append(
+      artistSearchIcon,
+      artistSearchInput
+    );
+
+    artistSearchPanel.append(
+      artistSearchHeading,
+      artistSearchWrap,
+      artistSearchResults,
+      createElement(
+        "div",
+        "stats-artist-search-hint",
+        "Search any artist in your listening history to view their personal listening statistics."
+      )
+    );
+
     const grid = createElement("div", "stats-dashboard-grid");
 
     const artistsPanel = createElement("section", "stats-panel");
@@ -1891,17 +2001,6 @@
 
     grid.append(artistsPanel, albumsPanel);
 
-    const chartPanel = createElement("section", "stats-panel");
-
-    chartPanel.appendChild(
-      createPanelHeading("Listening activity", "MONTHLY PLAYS")
-    );
-
-    const chart = createElement("div", "stats-chart");
-    chart.id = "stats-monthly-chart";
-
-    chartPanel.appendChild(chart);
-
     const metadataStatus = createElement(
       "div",
       "stats-metadata-status",
@@ -1910,14 +2009,13 @@
 
     metadataStatus.id = "stats-metadata-status";
 
-    chartPanel.appendChild(metadataStatus);
-
     dashboard.append(
       header,
       periodRow,
       metrics,
+      artistSearchPanel,
       grid,
-      chartPanel
+      metadataStatus
     );
 
     const uploadSection = document.querySelector(".upload-section");
@@ -1941,10 +2039,8 @@
     renderDashboard();
     createArtistModal();
 
-    // Start the three metadata tasks independently.
-    // Artist images use the fast Spotify-only endpoint.
-    // Extended metadata runs in the background.
-    // Album artwork retains its existing oEmbed endpoint.
+    // These requests run independently.
+    // Artist images are prioritized and displayed as each batch finishes.
     loadAllArtistImages();
     loadAllArtistMetadata();
     loadAllAlbumCovers();
@@ -1972,7 +2068,9 @@
     renderMetrics(stats);
     renderTopArtists(stats);
     renderTopAlbums(stats);
-    renderMonthlyActivity();
+    renderArtistSearchResults(
+      document.getElementById("stats-artist-search-input")?.value || ""
+    );
   }
 
   function renderMetrics(stats) {
@@ -2017,6 +2115,87 @@
       container.appendChild(card);
     });
   }
+
+  // --------------------------------------------------
+  // Artist Search
+  // --------------------------------------------------
+
+  function renderArtistSearchResults(searchTerm) {
+    const container = document.getElementById(
+      "stats-artist-search-results"
+    );
+
+    if (!container) return;
+
+    container.replaceChildren();
+
+    const query = normalizeArtistKey(searchTerm);
+
+    if (!query) return;
+
+    const artists = getAllTimeArtists();
+
+    const matches = artists
+      .filter((artist) =>
+        normalizeArtistKey(artist.name).includes(query)
+      )
+      .slice(0, ARTIST_SEARCH_RESULT_LIMIT);
+
+    if (matches.length === 0) {
+      container.appendChild(
+        createElement(
+          "div",
+          "stats-empty",
+          "No matching artists found in your listening history."
+        )
+      );
+
+      return;
+    }
+
+    matches.forEach((artist) => {
+      const result = createElement(
+        "button",
+        "stats-artist-search-result"
+      );
+
+      result.type = "button";
+
+      const name = createElement(
+        "span",
+        "stats-artist-search-result-name",
+        artist.name
+      );
+
+      const plays = createElement(
+        "span",
+        "stats-artist-search-result-plays",
+        `${formatNumber(artist.plays)} plays`
+      );
+
+      result.append(name, plays);
+
+      result.addEventListener("click", () => {
+        openArtistModal(artist.name);
+      });
+
+      container.appendChild(result);
+    });
+
+    if (matches.length === ARTIST_SEARCH_RESULT_LIMIT) {
+      const hint = createElement(
+        "div",
+        "stats-artist-search-hint",
+        "Showing the first 10 matches. Refine your search to find another artist."
+      );
+
+      container.appendChild(hint);
+    }
+  }
+
+  // --------------------------------------------------
+  // Top artists
+  // --------------------------------------------------
 
   function renderTopArtists(stats) {
     const container = document.getElementById("stats-top-artists");
@@ -2070,10 +2249,8 @@
 
       image.addEventListener("error", () => {
         image.hidden = true;
-        image.dataset.loadedUrl = "";
-
         placeholder.hidden = false;
-      });
+      }, { once: true });
 
       imageWrap.append(image, placeholder);
 
@@ -2126,6 +2303,10 @@
 
     refreshArtistImages();
   }
+
+  // --------------------------------------------------
+  // Top albums
+  // --------------------------------------------------
 
   function renderTopAlbums(stats) {
     const container = document.getElementById("stats-top-albums");
@@ -2214,66 +2395,6 @@
       row.append(identity, rowStats);
 
       container.appendChild(row);
-    });
-  }
-
-  // --------------------------------------------------
-  // Monthly activity chart
-  // --------------------------------------------------
-
-  function renderMonthlyActivity() {
-    const container = document.getElementById("stats-monthly-chart");
-
-    if (!container) return;
-
-    container.replaceChildren();
-
-    const activity = getMonthlyActivity(dashboardRecords);
-
-    if (activity.length === 0) {
-      container.appendChild(
-        createElement(
-          "div",
-          "stats-empty",
-          "No monthly activity found."
-        )
-      );
-
-      return;
-    }
-
-    const maxPlays = Math.max(
-      ...activity.map((item) => item[1]),
-      1
-    );
-
-    activity.forEach(([key, plays]) => {
-      const [year, month] = key.split("-").map(Number);
-
-      const date = new Date(year, month - 1, 1);
-
-      const column = createElement("div", "stats-chart-column");
-      const barWrap = createElement("div", "stats-chart-bar-wrap");
-      const bar = createElement("div", "stats-chart-bar");
-
-      bar.style.height =
-        `${Math.max(3, (plays / maxPlays) * 100)}%`;
-
-      bar.title = `${formatNumber(plays)} plays`;
-
-      barWrap.appendChild(bar);
-
-      const label = createElement(
-        "span",
-        "stats-chart-month",
-        date.toLocaleDateString(undefined, {
-          month: "short"
-        })
-      );
-
-      column.append(barWrap, label);
-
-      container.appendChild(column);
     });
   }
 
@@ -2535,6 +2656,7 @@
     artistMetadataCache.clear();
     artistImageCache.clear();
     artistMetadataRequests.clear();
+    artistImageRequests.clear();
 
     albumCoverCache.clear();
     albumCoverRequests.clear();
@@ -2546,9 +2668,6 @@
     metadataLoadedCount = 0;
     metadataTotalCount = 0;
     artistImagesLoadedCount = 0;
-
-    metadataStatusMessage = "";
-    artistImageStatusMessage = "";
 
     try {
       createDashboard();
@@ -2601,6 +2720,7 @@
     artistMetadataCache.clear();
     artistImageCache.clear();
     artistMetadataRequests.clear();
+    artistImageRequests.clear();
 
     albumCoverCache.clear();
     albumCoverRequests.clear();
@@ -2612,9 +2732,6 @@
     metadataLoadedCount = 0;
     metadataTotalCount = 0;
     artistImagesLoadedCount = 0;
-
-    metadataStatusMessage = "";
-    artistImageStatusMessage = "";
 
     resetUpload();
 
