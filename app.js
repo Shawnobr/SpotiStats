@@ -156,8 +156,8 @@
     validationMessage.style.color = "";
   }
 
-  function setButtonState(enabled) {
-    if (processButton) processButton.disabled = !enabled;
+  function setState(enabled) {
+    if (process) process.disabled = !enabled;
   }
 
   // --------------------------------------------------
@@ -185,10 +185,10 @@
     if (fileSize) fileSize.textContent = "";
 
     hideMessage();
-    setButtonState(false);
+    setState(false);
 
-    if (processButton) {
-      processButton.innerHTML = 'Process listening history <span>→</span>';
+    if (process) {
+      process.innerHTML = 'Process listening history <span>→</span>';
     }
   }
 
@@ -2254,9 +2254,18 @@
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
-  if (processButton) {
-    processButton.addEventListener("click", startStatistics);
-  }
+
+if (processButton) {
+  processButton.addEventListener("click", () => {
+    console.log("PROCESS CLICKED");
+    console.log("Current file:", currentFile);
+    console.log("Is validated:", isValidated);
+    console.log("Validated records:", validatedRecords.length);
+
+    startStatistics();
+  });
+}
+
 
   // --------------------------------------------------
   // Clear imported data when leaving the page
