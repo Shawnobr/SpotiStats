@@ -32,7 +32,7 @@
   let validationRun = 0;
   let isValidated = false;
   let dashboardRecords = [];
-  let selectedPeriod = "month";
+  let selectedPeriod = "all";
 
   // Full metadata records are kept in memory for future features.
   const artistMetadataCache = new Map();
@@ -41,7 +41,13 @@
   // Image cache is separate so images can be reused without re-fetching metadata.
   const artistImageCache = new Map();
 
+  // Album artwork is resolved through the Cloudflare Worker.
+  // Cloudflare KV provides persistent caching between browser sessions.
+  const albumCoverCache = new Map();
+  const albumCoverRequests = new Map();
+
   let metadataLoading = false;
+  let albumCoverLoading = false;
   let metadataLoadedCount = 0;
   let metadataTotalCount = 0;
 
@@ -716,6 +722,7 @@
       .stats-album-row {
         display: flex;
         justify-content: space-between;
+        align-items: center;
         gap: 15px;
         padding: 13px 0;
         border-bottom: 1px solid #292c30;
@@ -723,6 +730,30 @@
 
       .stats-album-row:last-child {
         border-bottom: 0;
+      }
+
+      .stats-album-identity {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        min-width: 0;
+      }
+
+      .stats-album-cover,
+      .stats-album-cover-placeholder {
+        width: 48px;
+        height: 48px;
+        flex: 0 0 48px;
+        border-radius: 6px;
+        object-fit: cover;
+        background: #30343a;
+      }
+
+      .stats-album-cover-placeholder {
+        display: grid;
+        place-items: center;
+        color: #d5fb62;
+        font: 14px "DM Mono", monospace;
       }
 
       .stats-album-name {
@@ -961,7 +992,7 @@
     }
 
     const cutoff = new Date();
-    cutoff.setDate(cutoff.getDate() - 30);
+    cutoff.setDate(cutoff.getDate() - (selectedPeriod === "year" ? 365 : 30));
 
     return dashboardRecords.filter(
       (record) => record.date >= cutoff
@@ -969,401 +1000,754 @@
   }
 
   function calculateStatistics(records) {
-    const artists = new Map();
-    const albums = new Map();
-    const tracks = new Map();
+    const artistMap = new Map();
+    const albumMap = new Map();
+    const trackMap = new Map();
+    const dailyMap = new Map();
 
-    let totalDuration = 0;
+    let totalMinutes = 0;
 
-    records.forEach((record) => {
-      totalDuration += record.duration;
+    for (const record of records) {
+      const artistKey = normalizeArtistKey(record.artistName);
+      const albumKey = `${artistKey}::${normalize(record.albumName || "Unknown album")}`;
+      const trackKey = getTrackKey(record);
 
-      const artistKey = normalize(record.artistName);
+      totalMinutes += record.duration;
 
-      if (!artists.has(artistKey)) {
-        artists.set(artistKey, {
+      if (!artistMap.has(artistKey)) {
+        artistMap.set(artistKey, {
           name: record.artistName,
           plays: 0,
-          duration: 0,
-          tracks: new Map(),
-          albums: new Map(),
-          monthly: new Map()
+          minutes: 0,
+          tracks: new Set(),
+          records: []
         });
       }
 
-      const artist = artists.get(artistKey);
+      const artist = artistMap.get(artistKey);
       artist.plays++;
-      artist.duration += record.duration;
+      artist.minutes += record.duration;
+      artist.tracks.add(trackKey);
+      artist.records.push(record);
 
-      const trackKey = getTrackKey(record);
+      if (!albumMap.has(albumKey)) {
+        albumMap.set(albumKey, {
+          name: record.albumName || "Unknown album",
+          artist: record.artistName,
+          plays: 0,
+          minutes: 0,
+          tracks: new Set(),
+          spotifyTrackUri: record.spotifyTrackUri
+        });
+      }
 
-      if (!tracks.has(trackKey)) {
-        tracks.set(trackKey, {
+      const album = albumMap.get(albumKey);
+      album.plays++;
+      album.minutes += record.duration;
+      album.tracks.add(trackKey);
+
+      if (!trackMap.has(trackKey)) {
+        trackMap.set(trackKey, {
           name: record.trackName,
-          artistName: record.artistName,
-          artistKey,
+          artist: record.artistName,
           plays: 0,
           duration: 0
         });
       }
 
-      const track = tracks.get(trackKey);
+      const track = trackMap.get(trackKey);
       track.plays++;
       track.duration += record.duration;
 
-      artist.tracks.set(trackKey, track);
+      const dayKey = record.date.toISOString().slice(0, 10);
+      dailyMap.set(dayKey, (dailyMap.get(dayKey) || 0) + record.duration);
+    }
 
-      const monthKey = [
-        record.date.getFullYear(),
-        String(record.date.getMonth() + 1).padStart(2, "0")
-      ].join("-");
+    const artists = Array.from(artistMap.values())
+      .map((artist) => ({
+        ...artist,
+        uniqueTracks: artist.tracks.size
+      }))
+      .sort((a, b) => b.plays - a.plays);
 
-      artist.monthly.set(
-        monthKey,
-        (artist.monthly.get(monthKey) || 0) + 1
-      );
+    const albums = Array.from(albumMap.values())
+      .map((album) => ({
+        ...album,
+        uniqueTracks: album.tracks.size
+      }))
+      .sort((a, b) => b.plays - a.plays);
 
-      if (record.albumName) {
-        const albumKey =
-          `${artistKey}::${normalize(record.albumName)}`;
-
-        if (!albums.has(albumKey)) {
-          albums.set(albumKey, {
-            name: record.albumName,
-            artistName: record.artistName,
-            plays: 0,
-            tracks: new Set()
-          });
-        }
-
-        const album = albums.get(albumKey);
-        album.plays++;
-        album.tracks.add(trackKey);
-
-        artist.albums.set(albumKey, album);
-      }
-    });
+    const tracks = Array.from(trackMap.values())
+      .sort((a, b) => b.plays - a.plays);
 
     return {
       totalPlays: records.length,
-      uniqueSongs: tracks.size,
-      uniqueArtists: artists.size,
-      totalDuration,
-      artists: [...artists.values()].sort((a, b) => b.plays - a.plays),
-      albums: [...albums.values()].sort((a, b) => b.plays - a.plays),
-      tracks: [...tracks.values()]
+      totalMinutes: totalMinutes / 60000,
+      uniqueTracks: trackMap.size,
+      uniqueArtists: artistMap.size,
+      artists,
+      albums,
+      tracks,
+      daily: dailyMap
     };
   }
 
-  function getMonthlyActivity(records) {
-    const months = new Map();
-
-    records.forEach((record) => {
-      const key = [
-        record.date.getFullYear(),
-        String(record.date.getMonth() + 1).padStart(2, "0")
-      ].join("-");
-
-      months.set(key, (months.get(key) || 0) + 1);
-    });
-
-    const sorted = [...months.entries()]
-      .sort((a, b) => a[0].localeCompare(b[0]));
-
-    return sorted.slice(-12);
-  }
-
   // --------------------------------------------------
-  // Cloudflare artist metadata service
+  // Artist and album metadata helpers
   // --------------------------------------------------
 
-  function getUniqueArtistNames() {
-    const unique = new Map();
+  function getSpotifyTrackUrl(value) {
+    if (!value) return null;
 
-    dashboardRecords.forEach((record) => {
-      const name = record.artistName.trim();
-      const key = normalizeArtistKey(name);
+    const textValue = String(value).trim();
 
-      if (key && !unique.has(key)) {
-        unique.set(key, name);
-      }
-    });
-
-    return [...unique.values()];
-  }
-
-  function getArtistMetadata(artistName) {
-    const key = normalizeArtistKey(artistName);
-    return artistMetadataCache.get(key) || null;
-  }
-
-  function getArtistImageUrl(metadata) {
-    const images = metadata?.images;
-
-    if (!images) return null;
-
-    const candidates = [
-      images.artistSmallThumb,
-      images.artistThumb,
-      images.artistMediumThumb,
-      images.artistWideThumb,
-      images.artistFanart,
-      images.artistFanart2,
-      images.artistFanart3,
-      images.artistFanart4
-    ];
-
-    return candidates.find(
-      (url) => typeof url === "string" && /^https:\/\//i.test(url)
-    ) || null;
-  }
-
-  function storeArtistMetadata(metadata) {
-    if (!metadata || typeof metadata !== "object") return;
-
-    const requestedName = metadata.requestedName;
-    const canonicalName = metadata.identity?.name;
-
-    const names = [requestedName, canonicalName].filter(Boolean);
-
-    names.forEach((name) => {
-      const key = normalizeArtistKey(name);
-      if (key) artistMetadataCache.set(key, metadata);
-    });
-
-    names.forEach((name) => {
-      const key = normalizeArtistKey(name);
-      const imageUrl = getArtistImageUrl(metadata);
-
-      if (key && imageUrl) {
-        artistImageCache.set(key, {
-          url: imageUrl,
-          artistName: canonicalName || name,
-          musicBrainzArtistId:
-            metadata.identity?.musicBrainzId || null,
-          attribution: `${canonicalName || name} · TheAudioDB`
-        });
-      }
-    });
-  }
-
-  async function fetchArtistMetadataBatch(names) {
-    const response = await fetch(`${METADATA_API_URL}/api/artists`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ names })
-    });
-
-    let data;
+    if (textValue.startsWith("spotify:track:")) {
+      const id = textValue.split(":").pop();
+      return id ? `https://open.spotify.com/track/${id}` : null;
+    }
 
     try {
-      data = await response.json();
+      const url = new URL(textValue);
+
+      if (
+        url.protocol === "https:" &&
+        url.hostname === "open.spotify.com" &&
+        url.pathname.startsWith("/track/")
+      ) {
+        return `https://open.spotify.com/track/${url.pathname.split("/")[2]}`;
+      }
     } catch {
-      throw new Error("The metadata service returned an unreadable response.");
+      return null;
     }
 
-    if (!response.ok) {
-      throw new Error(
-        data.error || `Metadata service returned HTTP ${response.status}.`
-      );
-    }
-
-    if (!Array.isArray(data.results)) {
-      throw new Error("The metadata service returned an unexpected response.");
-    }
-
-    return data;
+    return null;
   }
 
-  function updateMetadataStatus(message) {
-    const status = document.getElementById("stats-metadata-status");
+  function getAlbumTrackInput(album) {
+    if (!album) return null;
 
-    if (status) {
-      status.textContent = message;
+    return getSpotifyTrackUrl(album.spotifyTrackUri);
+  }
+
+  async function fetchAlbumCover(album) {
+    const trackUrl = getAlbumTrackInput(album);
+
+    if (!trackUrl) return null;
+
+    if (albumCoverCache.has(trackUrl)) {
+      return albumCoverCache.get(trackUrl);
     }
+
+    if (albumCoverRequests.has(trackUrl)) {
+      return albumCoverRequests.get(trackUrl);
+    }
+
+    const request = (async () => {
+      try {
+        const response = await fetch(`${METADATA_API_URL}/api/album-cover`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            trackUrl
+          })
+        });
+
+        if (!response.ok) {
+          throw new Error(`Album artwork lookup failed (${response.status}).`);
+        }
+
+        const data = await response.json();
+        const imageUrl = data?.imageUrl || null;
+
+        if (imageUrl) {
+          albumCoverCache.set(trackUrl, imageUrl);
+        }
+
+        return imageUrl;
+      } catch (error) {
+        console.warn("Album artwork lookup failed:", error);
+        return null;
+      } finally {
+        albumCoverRequests.delete(trackUrl);
+      }
+    })();
+
+    albumCoverRequests.set(trackUrl, request);
+
+    return request;
+  }
+
+  async function loadAllAlbumCovers() {
+    if (albumCoverLoading) return;
+
+    albumCoverLoading = true;
+
+    try {
+      // Always prioritize albums by all-time play count, regardless of
+      // the currently selected dashboard period.
+      const allTimeStats = calculateStatistics(dashboardRecords);
+      const albums = allTimeStats.albums.filter(
+        (album) => getAlbumTrackInput(album)
+      );
+
+      if (!albums.length) {
+        albumCoverLoading = false;
+        return;
+      }
+
+      const topAlbums = albums.slice(0, 10);
+      const remainingAlbums = albums.slice(10);
+
+      const loadBatch = async (batch) => {
+        await Promise.all(
+          batch.map(async (album) => {
+            await fetchAlbumCover(album);
+          })
+        );
+
+        renderDashboard();
+      };
+
+      // Load the ten most-listened-to albums first.
+      await loadBatch(topAlbums);
+
+      // Continue with the remaining albums in manageable batches.
+      for (
+        let index = 0;
+        index < remainingAlbums.length;
+        index += METADATA_BATCH_SIZE
+      ) {
+        const batch = remainingAlbums.slice(
+          index,
+          index + METADATA_BATCH_SIZE
+        );
+
+        await loadBatch(batch);
+      }
+    } catch (error) {
+      console.warn("Album artwork loading encountered an error:", error);
+    } finally {
+      albumCoverLoading = false;
+    }
+  }
+
+  function getArtistMetadataImage(metadata) {
+    if (!metadata || typeof metadata !== "object") return null;
+
+    const images = metadata.images || {};
+
+    return (
+      images.artistThumb ||
+      images.artistThumbHQ ||
+      images.artistFanart ||
+      images.artistBanner ||
+      images.artistLogo ||
+      images.artistClearart ||
+      metadata.image ||
+      null
+    );
+  }
+
+  async function fetchArtistMetadata(artistName) {
+    const artistKey = normalizeArtistKey(artistName);
+
+    if (!artistKey) return null;
+
+    if (artistMetadataCache.has(artistKey)) {
+      return artistMetadataCache.get(artistKey);
+    }
+
+    if (artistMetadataRequests.has(artistKey)) {
+      return artistMetadataRequests.get(artistKey);
+    }
+
+    const request = (async () => {
+      try {
+        const response = await fetch(`${METADATA_API_URL}/api/artist?name=${encodeURIComponent(artistName)}`);
+
+        if (!response.ok) {
+          throw new Error(`Artist metadata lookup failed (${response.status}).`);
+        }
+
+        const data = await response.json();
+        const artist = data?.artist || null;
+
+        if (artist) {
+          artistMetadataCache.set(artistKey, artist);
+
+          const image = getArtistMetadataImage(artist);
+
+          if (image) {
+            artistImageCache.set(artistKey, image);
+          }
+        }
+
+        return artist;
+      } catch (error) {
+        console.warn(`Metadata lookup failed for ${artistName}:`, error);
+        return null;
+      } finally {
+        artistMetadataRequests.delete(artistKey);
+      }
+    })();
+
+    artistMetadataRequests.set(artistKey, request);
+
+    return request;
+  }
+
+  async function fetchArtistMetadataBatch(artistNames) {
+    const namesToFetch = artistNames.filter((name) => {
+      const key = normalizeArtistKey(name);
+
+      return (
+        key &&
+        !artistMetadataCache.has(key) &&
+        !artistMetadataRequests.has(key)
+      );
+    });
+
+    if (!namesToFetch.length) return [];
+
+    const results = [];
+
+    for (
+      let index = 0;
+      index < namesToFetch.length;
+      index += METADATA_BATCH_SIZE
+    ) {
+      const batch = namesToFetch.slice(
+        index,
+        index + METADATA_BATCH_SIZE
+      );
+
+      try {
+        const response = await fetch(`${METADATA_API_URL}/api/artists`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            names: batch
+          })
+        });
+
+        if (!response.ok) {
+          throw new Error(`Artist metadata batch failed (${response.status}).`);
+        }
+
+        const data = await response.json();
+        const batchResults = Array.isArray(data?.results)
+          ? data.results
+          : [];
+
+        for (const result of batchResults) {
+          const requestedName = result.requestedName || "";
+          const key = normalizeArtistKey(requestedName);
+          const artist = result.artist || null;
+
+          if (key && artist) {
+            artistMetadataCache.set(key, artist);
+
+            const image = getArtistMetadataImage(artist);
+
+            if (image) {
+              artistImageCache.set(key, image);
+            }
+          }
+
+          results.push(result);
+        }
+      } catch (error) {
+        console.warn("Artist metadata batch failed:", error);
+      }
+    }
+
+    return results;
   }
 
   async function loadAllArtistMetadata() {
     if (metadataLoading) return;
 
-    const names = getUniqueArtistNames();
-
-    metadataTotalCount = names.length;
+    metadataLoading = true;
     metadataLoadedCount = 0;
 
-    if (names.length === 0) {
-      updateMetadataStatus("No artist metadata to load.");
-      return;
-    }
-
-    const uncachedNames = names.filter(
-      (name) => !getArtistMetadata(name)
-    );
-
-    if (uncachedNames.length === 0) {
-      metadataLoadedCount = names.length;
-      updateMetadataStatus(
-        `Artist metadata ready · ${formatNumber(names.length)} artists`
-      );
-      refreshArtistImages();
-      return;
-    }
-
-    metadataLoading = true;
-
-    updateMetadataStatus(
-      `Loading artist metadata · 0 of ${formatNumber(names.length)}`
-    );
-
     try {
-      for (
-        let start = 0;
-        start < uncachedNames.length;
-        start += METADATA_BATCH_SIZE
-      ) {
-        const batch = uncachedNames.slice(
-          start,
-          start + METADATA_BATCH_SIZE
-        );
+      // Prioritize the most-listened-to artists across all time.
+      const allTimeStats = calculateStatistics(dashboardRecords);
+      const artists = allTimeStats.artists;
 
-        // Avoid requesting the same artist more than once in this session.
-        const requestNames = batch.filter((name) => {
-          const key = normalizeArtistKey(name);
-          return !artistMetadataRequests.has(key);
-        });
+      metadataTotalCount = artists.length;
 
-        if (requestNames.length > 0) {
-          requestNames.forEach((name) => {
-            const key = normalizeArtistKey(name);
-            artistMetadataRequests.set(key, true);
-          });
-
-          try {
-            const data = await fetchArtistMetadataBatch(requestNames);
-
-            data.results.forEach((result) => {
-              if (result.artist) {
-                storeArtistMetadata(result.artist);
-              } else {
-                console.warn(
-                  `No metadata found for ${result.requestedName}:`,
-                  result.error || "No provider match."
-                );
-              }
-            });
-          } finally {
-            requestNames.forEach((name) => {
-              artistMetadataRequests.delete(normalizeArtistKey(name));
-            });
-          }
-        }
-
-        metadataLoadedCount = Math.min(
-          names.length,
-          metadataLoadedCount + batch.length
-        );
-
-        updateMetadataStatus(
-          `Loading artist metadata · ${formatNumber(metadataLoadedCount)} of ${formatNumber(names.length)}`
-        );
-
-        refreshArtistImages();
+      if (!artists.length) {
+        metadataLoading = false;
+        return;
       }
 
-      const foundCount = names.filter(
-        (name) => getArtistMetadata(name)
-      ).length;
+      const topArtists = artists.slice(0, 10);
+      const remainingArtists = artists.slice(10);
 
-      updateMetadataStatus(
-        `Artist metadata ready · ${formatNumber(foundCount)} of ${formatNumber(names.length)} artists matched`
-      );
+      const updateStatus = () => {
+        const status = document.getElementById("stats-metadata-status");
 
-      refreshArtistImages();
+        if (status) {
+          status.textContent =
+            `Artist images: ${metadataLoadedCount.toLocaleString()} / ${metadataTotalCount.toLocaleString()} processed`;
+        }
+      };
 
+      const loadBatch = async (batch) => {
+        const names = batch.map((artist) => artist.name);
+        await fetchArtistMetadataBatch(names);
+
+        metadataLoadedCount += batch.length;
+        updateStatus();
+        renderDashboard();
+      };
+
+      // Load the ten most-listened-to artists first.
+      await loadBatch(topArtists);
+
+      // Continue with the remaining artists in batches.
+      for (
+        let index = 0;
+        index < remainingArtists.length;
+        index += METADATA_BATCH_SIZE
+      ) {
+        const batch = remainingArtists.slice(
+          index,
+          index + METADATA_BATCH_SIZE
+        );
+
+        await loadBatch(batch);
+      }
     } catch (error) {
-      console.error("Artist metadata loading failed:", error);
-
-      updateMetadataStatus(
-        "Artist metadata could not finish loading. Reload the page to try again."
-      );
+      console.warn("Artist metadata loading encountered an error:", error);
     } finally {
       metadataLoading = false;
     }
   }
 
   // --------------------------------------------------
-  // Artist images
+  // Artist modal
   // --------------------------------------------------
 
-  function applyArtistImage(artistName, avatar) {
-    if (!avatar || !avatar.isConnected) return;
+  function getArtistListeningStats(artistName) {
+    const artistKey = normalizeArtistKey(artistName);
 
-    const key = normalizeArtistKey(artistName);
-    const image = artistImageCache.get(key);
+    const records = getFilteredRecords().filter(
+      (record) => normalizeArtistKey(record.artistName) === artistKey
+    );
 
-    if (!image) return;
+    const stats = calculateStatistics(records);
 
-    const img = document.createElement("img");
-    img.className = "stats-artist-avatar";
-    img.src = image.url;
-    img.alt = `${image.artistName || artistName} profile`;
-    img.title = image.attribution || artistName;
-    img.loading = "lazy";
-    img.referrerPolicy = "no-referrer";
-
-    img.addEventListener("error", () => {
-      img.replaceWith(avatar);
-    }, { once: true });
-
-    avatar.replaceWith(img);
+    return {
+      records,
+      stats
+    };
   }
 
-  function loadArtistImage(artistName, avatar) {
-    if (!avatar) return;
+  function showArtistModal(artistName) {
+    const existing = document.querySelector(".stats-modal");
 
-    const key = normalizeArtistKey(artistName);
-    if (!key) return;
+    if (existing) existing.remove();
 
-    // Metadata and image cache are already populated in memory.
-    if (artistImageCache.has(key)) {
-      applyArtistImage(artistName, avatar);
-      return;
+    const { records, stats } = getArtistListeningStats(artistName);
+
+    const modal = createElement("div", "stats-modal");
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-label", `${artistName} listening statistics`);
+
+    const content = createElement("div", "stats-modal-content");
+
+    const header = createElement("div", "stats-modal-header");
+    const headingGroup = createElement("div");
+    const heading = createElement("h2", "", artistName);
+    const subtitle = createElement(
+      "div",
+      "stats-modal-subtitle",
+      `${formatNumber(stats.totalPlays)} plays in the selected period`
+    );
+
+    headingGroup.append(heading, subtitle);
+
+    const closeButton = createElement("button", "stats-modal-close", "×");
+    closeButton.type = "button";
+    closeButton.setAttribute("aria-label", "Close artist statistics");
+    closeButton.addEventListener("click", () => modal.remove());
+
+    header.append(headingGroup, closeButton);
+
+    const metrics = createElement("div", "stats-modal-metrics");
+
+    const metricData = [
+      ["TOTAL PLAYS", formatNumber(stats.totalPlays)],
+      ["LISTENING TIME", formatDuration(stats.totalMinutes * 60000)],
+      ["UNIQUE SONGS", formatNumber(stats.uniqueTracks)]
+    ];
+
+    for (const [label, value] of metricData) {
+      const metric = createElement("div", "stats-modal-metric");
+      const strong = createElement("strong", "", value);
+      const span = createElement("span", "", label);
+      metric.append(strong, span);
+      metrics.appendChild(metric);
     }
 
-    // If metadata is available but there is no image, don't make another request.
-    const metadata = getArtistMetadata(artistName);
+    const topTracksHeading = createElement("h3", "", "MOST PLAYED SONGS");
+    const topTracksList = createElement("div", "stats-modal-list");
 
-    if (metadata) {
-      const imageUrl = getArtistImageUrl(metadata);
+    const topTracks = stats.tracks.slice(0, 10);
 
-      if (!imageUrl) return;
-
-      const image = {
-        url: imageUrl,
-        artistName: metadata.identity?.name || artistName,
-        musicBrainzArtistId: metadata.identity?.musicBrainzId || null,
-        attribution: `${metadata.identity?.name || artistName} · TheAudioDB`
-      };
-
-      artistImageCache.set(key, image);
-      applyArtistImage(artistName, avatar);
+    if (!topTracks.length) {
+      topTracksList.appendChild(
+        createElement("div", "stats-empty", "No listening data for this artist in this period.")
+      );
+    } else {
+      for (const track of topTracks) {
+        const item = createElement("div", "stats-modal-list-item");
+        const name = createElement("span", "", track.name);
+        const count = createElement("span", "", `${formatNumber(track.plays)} plays`);
+        item.append(name, count);
+        topTracksList.appendChild(item);
+      }
     }
+
+    const albumsHeading = createElement("h3", "", "MOST PLAYED ALBUMS");
+    const albumsList = createElement("div", "stats-modal-list");
+
+    if (!stats.albums.length) {
+      albumsList.appendChild(
+        createElement("div", "stats-empty", "No album data available.")
+      );
+    } else {
+      for (const album of stats.albums.slice(0, 10)) {
+        const item = createElement("div", "stats-modal-list-item");
+        const name = createElement("span", "", album.name);
+        const count = createElement("span", "", `${formatNumber(album.plays)} plays`);
+        item.append(name, count);
+        albumsList.appendChild(item);
+      }
+    }
+
+    content.append(
+      header,
+      metrics,
+      topTracksHeading,
+      topTracksList,
+      albumsHeading,
+      albumsList
+    );
+
+    modal.appendChild(content);
+
+    modal.addEventListener("click", (event) => {
+      if (event.target === modal) modal.remove();
+    });
+
+    document.addEventListener("keydown", function handleEscape(event) {
+      if (event.key === "Escape" && modal.isConnected) {
+        modal.remove();
+        document.removeEventListener("keydown", handleEscape);
+      }
+    });
+
+    document.body.appendChild(modal);
+    closeButton.focus();
   }
 
-  function refreshArtistImages() {
-    const search = document.getElementById("stats-artist-search");
+  // --------------------------------------------------
+  // Dashboard rendering
+  // --------------------------------------------------
 
-    if (search) {
-      renderArtistList();
+  function renderDashboard() {
+    const dashboard = document.querySelector(".stats-dashboard");
+
+    if (!dashboard) return;
+
+    const records = getFilteredRecords();
+    const stats = calculateStatistics(records);
+
+    const totalPlaysValue = document.getElementById("stats-total-plays");
+    const totalMinutesValue = document.getElementById("stats-total-minutes");
+    const uniqueTracksValue = document.getElementById("stats-unique-tracks");
+    const uniqueArtistsValue = document.getElementById("stats-unique-artists");
+
+    if (totalPlaysValue) {
+      totalPlaysValue.textContent = formatNumber(stats.totalPlays);
     }
 
-    const topArtists = document.getElementById("stats-top-artists");
+    if (totalMinutesValue) {
+      totalMinutesValue.textContent = formatDuration(stats.totalMinutes * 60000);
+    }
 
-    if (topArtists) {
-      const stats = calculateStatistics(getFilteredRecords());
-      renderTopArtists(stats.artists);
+    if (uniqueTracksValue) {
+      uniqueTracksValue.textContent = formatNumber(stats.uniqueTracks);
+    }
+
+    if (uniqueArtistsValue) {
+      uniqueArtistsValue.textContent = formatNumber(stats.uniqueArtists);
+    }
+
+    const artistList = document.getElementById("stats-artist-list");
+
+    if (artistList) {
+      artistList.innerHTML = "";
+
+      const topArtists = stats.artists.slice(0, 10);
+
+      if (!topArtists.length) {
+        artistList.appendChild(
+          createElement("div", "stats-empty", "No artists found for this period.")
+        );
+      }
+
+      for (const artist of topArtists) {
+        const button = createElement("button", "stats-artist-button");
+        button.type = "button";
+
+        const identity = createElement("div", "stats-artist-identity");
+        const artistKey = normalizeArtistKey(artist.name);
+        const imageUrl = artistImageCache.get(artistKey);
+
+        let avatar;
+
+        if (imageUrl) {
+          avatar = createElement("img", "stats-artist-avatar");
+          avatar.src = imageUrl;
+          avatar.alt = `${artist.name} profile`;
+          avatar.loading = "lazy";
+        } else {
+          avatar = createElement(
+            "div",
+            "stats-artist-avatar",
+            artist.name.slice(0, 1).toUpperCase()
+          );
+        }
+
+        const name = createElement("span", "stats-artist-name", artist.name);
+        identity.append(avatar, name);
+
+        const plays = createElement(
+          "span",
+          "stats-artist-plays",
+          `${formatNumber(artist.plays)} plays`
+        );
+
+        button.append(identity, plays);
+        button.addEventListener("click", () => showArtistModal(artist.name));
+
+        artistList.appendChild(button);
+      }
+    }
+
+    const albumList = document.getElementById("stats-album-list");
+
+    if (albumList) {
+      albumList.innerHTML = "";
+
+      const topAlbums = stats.albums.slice(0, 10);
+
+      if (!topAlbums.length) {
+        albumList.appendChild(
+          createElement("div", "stats-empty", "No albums found for this period.")
+        );
+      }
+
+      for (const album of topAlbums) {
+        const row = createElement("div", "stats-album-row");
+        const identity = createElement("div", "stats-album-identity");
+        const trackUrl = getAlbumTrackInput(album);
+        const coverUrl = trackUrl ? albumCoverCache.get(trackUrl) : null;
+
+        if (coverUrl) {
+          const image = createElement("img", "stats-album-cover");
+          image.src = coverUrl;
+          image.alt = `${album.name} album cover`;
+          image.loading = "lazy";
+          identity.appendChild(image);
+        } else {
+          identity.appendChild(
+            createElement("div", "stats-album-cover-placeholder", "♪")
+          );
+        }
+
+        const details = createElement("div");
+        details.append(
+          createElement("div", "stats-album-name", album.name),
+          createElement("div", "stats-album-artist", album.artist)
+        );
+
+        identity.appendChild(details);
+
+        const count = createElement(
+          "span",
+          "stats-album-count",
+          `${formatNumber(album.plays)} plays`
+        );
+
+        row.append(identity, count);
+        albumList.appendChild(row);
+      }
+    }
+
+    const metadataStatus = document.getElementById("stats-metadata-status");
+
+    if (metadataStatus && !metadataLoading) {
+      metadataStatus.textContent =
+        metadataLoadedCount > 0
+          ? `Artist images: ${metadataLoadedCount.toLocaleString()} / ${metadataTotalCount.toLocaleString()} processed`
+          : "Artist images load automatically, starting with your most-listened-to artists.";
+    }
+
+    renderListeningChart(stats);
+  }
+
+  function renderListeningChart(stats) {
+    const chart = document.getElementById("stats-listening-chart");
+
+    if (!chart) return;
+
+    chart.innerHTML = "";
+
+    const daily = stats.daily;
+    const dates = [];
+
+    const today = new Date();
+
+    for (let index = 6; index >= 0; index--) {
+      const date = new Date(today);
+      date.setDate(today.getDate() - index);
+      dates.push(date);
+    }
+
+    const values = dates.map((date) => {
+      const key = date.toISOString().slice(0, 10);
+      return daily.get(key) || 0;
+    });
+
+    const maximum = Math.max(...values, 1);
+
+    for (let index = 0; index < dates.length; index++) {
+      const column = createElement("div", "stats-chart-column");
+      const barWrap = createElement("div", "stats-chart-bar-wrap");
+      const bar = createElement("div", "stats-chart-bar");
+
+      bar.style.height = `${Math.max(3, (values[index] / maximum) * 100)}%`;
+      bar.title = formatDuration(values[index]);
+
+      const label = createElement(
+        "div",
+        "stats-chart-month",
+        dates[index].toLocaleDateString(undefined, { weekday: "short" })
+      );
+
+      barWrap.appendChild(bar);
+      column.append(barWrap, label);
+      chart.appendChild(column);
     }
   }
 
@@ -1371,180 +1755,119 @@
   // Dashboard construction
   // --------------------------------------------------
 
-  function createDashboard() {
+  function buildDashboard() {
     addDashboardStyles();
 
-    const existing = document.getElementById("stats-dashboard");
-    if (existing) existing.remove();
+    const uploadContainer =
+      document.querySelector(".upload-section") ||
+      document.querySelector("main") ||
+      document.body;
 
-    const dashboard = createElement("main", "stats-dashboard");
-    dashboard.id = "stats-dashboard";
+    const dashboard = createElement("section", "stats-dashboard");
+    dashboard.innerHTML = `
+      <div class="stats-topbar">
+        <div>
+          <div class="stats-eyebrow">YOUR LISTENING HISTORY</div>
+          <h1>Spotify <span>Stats</span></h1>
+          <p>Your listening habits, organized.</p>
+        </div>
+        <button type="button" class="stats-back-button" id="stats-back-button">
+          ← Upload another file
+        </button>
+      </div>
 
-    const topbar = createElement("div", "stats-topbar");
+      <div class="stats-period" role="group" aria-label="Listening period">
+        <button type="button" class="stats-period-button active" data-period="all">All Time</button>
+        <button type="button" class="stats-period-button" data-period="year">Past Year</button>
+        <button type="button" class="stats-period-button" data-period="month">Past Month</button>
+      </div>
 
-    const heading = createElement("div");
-    heading.appendChild(
-      createElement("div", "stats-eyebrow", "YOUR LISTENING HISTORY")
-    );
+      <div class="stats-grid">
+        <div class="stats-card">
+          <span class="stats-card-label">TOTAL PLAYS</span>
+          <strong class="stats-card-value" id="stats-total-plays">0</strong>
+          <span class="stats-card-note">Recorded listening sessions</span>
+        </div>
 
-    const title = createElement("h1");
-    title.append("Your music. ");
-    title.appendChild(createElement("span", "", "Your stats."));
-    heading.appendChild(title);
+        <div class="stats-card">
+          <span class="stats-card-label">LISTENING TIME</span>
+          <strong class="stats-card-value" id="stats-total-minutes">0 min</strong>
+          <span class="stats-card-note">Total time spent listening</span>
+        </div>
 
-    const backButton = createElement(
-      "button",
-      "stats-back-button",
-      "← Import another file"
-    );
-    backButton.type = "button";
-    backButton.addEventListener("click", returnToUpload);
+        <div class="stats-card">
+          <span class="stats-card-label">UNIQUE SONGS</span>
+          <strong class="stats-card-value" id="stats-unique-tracks">0</strong>
+          <span class="stats-card-note">Distinct songs played</span>
+        </div>
 
-    topbar.append(heading, backButton);
-    dashboard.appendChild(topbar);
+        <div class="stats-card">
+          <span class="stats-card-label">UNIQUE ARTISTS</span>
+          <strong class="stats-card-value" id="stats-unique-artists">0</strong>
+          <span class="stats-card-note">Different artists listened to</span>
+        </div>
+      </div>
 
-    const period = createElement("div", "stats-period");
+      <section class="stats-section">
+        <div class="stats-section-heading">
+          <h2>Top Artists</h2>
+          <span class="stats-section-label">BY PLAYS</span>
+        </div>
+        <div class="stats-panel">
+          <div class="stats-artist-list" id="stats-artist-list"></div>
+          <div class="stats-metadata-status" id="stats-metadata-status">
+            Artist images load automatically.
+          </div>
+        </div>
+      </section>
 
-    const monthButton = createElement(
-      "button",
-      "stats-period-button active",
-      "Past month"
-    );
-    monthButton.type = "button";
-    monthButton.dataset.period = "month";
+      <section class="stats-section">
+        <div class="stats-section-heading">
+          <h2>Top Albums</h2>
+          <span class="stats-section-label">BY PLAYS</span>
+        </div>
+        <div class="stats-panel">
+          <div class="stats-album-list" id="stats-album-list"></div>
+        </div>
+      </section>
 
-    const allButton = createElement(
-      "button",
-      "stats-period-button",
-      "All time"
-    );
-    allButton.type = "button";
-    allButton.dataset.period = "all";
+      <section class="stats-section">
+        <div class="stats-section-heading">
+          <h2>Listening Activity</h2>
+          <span class="stats-section-label">LAST 7 DAYS</span>
+        </div>
+        <div class="stats-panel">
+          <div class="stats-chart" id="stats-listening-chart"></div>
+        </div>
+      </section>
+    `;
 
-    monthButton.addEventListener("click", () => setPeriod("month"));
-    allButton.addEventListener("click", () => setPeriod("all"));
+    uploadContainer.appendChild(dashboard);
 
-    period.append(monthButton, allButton);
-    dashboard.appendChild(period);
+    const periodButtons = dashboard.querySelectorAll(".stats-period-button");
 
-    const dateNote = createElement("p", "stats-date-note");
-    dateNote.id = "stats-date-note";
-    dashboard.appendChild(dateNote);
+    periodButtons.forEach((button) => {
+      button.addEventListener("click", () => {
+        selectedPeriod = button.dataset.period;
 
-    const grid = createElement("div", "stats-grid");
-    grid.id = "stats-summary-grid";
-    dashboard.appendChild(grid);
+        periodButtons.forEach((periodButton) => {
+          periodButton.classList.toggle(
+            "active",
+            periodButton === button
+          );
+        });
 
-    // Artist search appears before Top Artists.
-    const artistSection = createElement("section", "stats-section");
+        renderDashboard();
+      });
+    });
 
-    const artistHeading = createElement(
-      "div",
-      "stats-section-heading"
-    );
-    artistHeading.appendChild(createElement("h2", "", "Artist Search"));
-    artistHeading.appendChild(
-      createElement("span", "stats-section-label", "YOUR LIBRARY")
-    );
+    const backButton = dashboard.querySelector("#stats-back-button");
 
-    const artistPanel = createElement("div", "stats-panel");
-
-    const search = document.createElement("input");
-    search.type = "search";
-    search.className = "stats-search";
-    search.id = "stats-artist-search";
-    search.placeholder = "Search artists in your listening history...";
-
-    const artistList = createElement("div", "stats-artist-list");
-    artistList.id = "stats-artist-list";
-
-    search.addEventListener("input", renderArtistList);
-
-    artistPanel.append(search, artistList);
-    artistSection.append(artistHeading, artistPanel);
-    dashboard.appendChild(artistSection);
-
-    const topArtistsSection = createElement("section", "stats-section");
-    const topArtistsHeading = createElement(
-      "div",
-      "stats-section-heading"
-    );
-    topArtistsHeading.appendChild(createElement("h2", "", "Top Artists"));
-    topArtistsHeading.appendChild(
-      createElement("span", "stats-section-label", "RANKED BY PLAYS")
-    );
-
-    const topArtistsPanel = createElement("div", "stats-panel");
-    const topArtistsList = createElement("div", "stats-artist-list");
-    topArtistsList.id = "stats-top-artists";
-
-    topArtistsPanel.appendChild(topArtistsList);
-    topArtistsSection.append(topArtistsHeading, topArtistsPanel);
-    dashboard.appendChild(topArtistsSection);
-
-    const albumsSection = createElement("section", "stats-section");
-    const albumsHeading = createElement(
-      "div",
-      "stats-section-heading"
-    );
-    albumsHeading.appendChild(createElement("h2", "", "Top Albums"));
-    albumsHeading.appendChild(
-      createElement("span", "stats-section-label", "RANKED BY PLAYS")
-    );
-
-    const albumsPanel = createElement("div", "stats-panel");
-    const albumsList = createElement("div", "stats-album-list");
-    albumsList.id = "stats-top-albums";
-
-    albumsPanel.appendChild(albumsList);
-    albumsSection.append(albumsHeading, albumsPanel);
-    dashboard.appendChild(albumsSection);
-
-    const activitySection = createElement("section", "stats-section");
-    const activityHeading = createElement(
-      "div",
-      "stats-section-heading"
-    );
-    activityHeading.appendChild(createElement("h2", "", "Monthly Activity"));
-    activityHeading.appendChild(
-      createElement("span", "stats-section-label", "TOTAL PLAYS")
-    );
-
-    const activityPanel = createElement("div", "stats-panel");
-    const chart = createElement("div", "stats-chart");
-    chart.id = "stats-monthly-chart";
-
-    activityPanel.appendChild(chart);
-    activitySection.append(activityHeading, activityPanel);
-    dashboard.appendChild(activitySection);
-
-    dashboard.appendChild(
-      createElement(
-        "p",
-        "stats-disclaimer",
-        "Statistics are calculated locally from your Spotify Extended Streaming History. Artist metadata and profile images are retrieved through SpotiStats Metadata API when available."
-      )
-    );
-
-    const metadataStatus = createElement(
-      "div",
-      "stats-metadata-status",
-      "Preparing artist metadata..."
-    );
-    metadataStatus.id = "stats-metadata-status";
-    dashboard.appendChild(metadataStatus);
-
-    const privacy = createElement(
-      "p",
-      "stats-disclaimer",
-      "Your listening history remains in this browser session. No listening records are uploaded or permanently stored. Only artist names are sent to the metadata service to retrieve artist information."
-    );
-
-    dashboard.appendChild(privacy);
-
-    const uploadSection = document.querySelector(".upload-section");
-
-    if (uploadSection) uploadSection.hidden = true;
+    if (backButton) {
+      backButton.addEventListener("click", () => {
+        restoreUploadView();
+      });
+    }
 
     // Move the full privacy disclosure below the dashboard content.
     if (privacyCard) {
@@ -1552,471 +1875,17 @@
       dashboard.appendChild(privacyCard);
     }
 
-    const pageShell = document.querySelector(".page-shell") || document.body;
-    const footer = document.querySelector(".site-footer");
-
-    if (footer && footer.parentNode === pageShell) {
-      pageShell.insertBefore(dashboard, footer);
-    } else {
-      pageShell.appendChild(dashboard);
-    }
-
-    createArtistModal();
-    renderDashboard();
-
-    // Start metadata retrieval in the background after the dashboard is ready.
-    loadAllArtistMetadata();
-  }
-
-  // --------------------------------------------------
-  // Dashboard rendering
-  // --------------------------------------------------
-
-  function setPeriod(period) {
-    selectedPeriod = period;
-
-    document.querySelectorAll(".stats-period-button").forEach((button) => {
-      button.classList.toggle(
-        "active",
-        button.dataset.period === period
-      );
-    });
-
     renderDashboard();
   }
 
-  function renderDashboard() {
-    const records = getFilteredRecords();
-    const stats = calculateStatistics(records);
-
-    const grid = document.getElementById("stats-summary-grid");
-    const dateNote = document.getElementById("stats-date-note");
-
-    if (!grid) return;
-
-    grid.replaceChildren();
-
-    const cards = [
-      {
-        label: "UNIQUE SONGS",
-        value: stats.uniqueSongs,
-        note: "Individual tracks listened to"
-      },
-      {
-        label: "UNIQUE ARTISTS",
-        value: stats.uniqueArtists,
-        note: "Different artists listened to"
-      },
-      {
-        label: "TOTAL PLAYS",
-        value: stats.totalPlays,
-        note: "Recorded listening sessions"
-      }
-    ];
-
-    cards.forEach((card) => {
-      const element = createElement("div", "stats-card");
-      element.appendChild(
-        createElement("div", "stats-card-label", card.label)
-      );
-      element.appendChild(
-        createElement("strong", "stats-card-value", formatNumber(card.value))
-      );
-      element.appendChild(
-        createElement("span", "stats-card-note", card.note)
-      );
-      grid.appendChild(element);
-    });
-
-    if (dateNote) {
-      dateNote.textContent =
-        selectedPeriod === "month"
-          ? "Showing the last 30 days"
-          : `Showing all ${formatNumber(dashboardRecords.length)} recorded plays`;
-    }
-
-    renderArtistList();
-    renderTopArtists(stats.artists);
-    renderTopAlbums(stats.albums);
-    renderMonthlyActivity();
-  }
-
   // --------------------------------------------------
-  // Artist search and lists
+  // Upload and dashboard transitions
   // --------------------------------------------------
 
-  function renderArtistList() {
-    const container = document.getElementById("stats-artist-list");
-    const search = document.getElementById("stats-artist-search");
-
-    if (!container) return;
-
-    const stats = calculateStatistics(getFilteredRecords());
-    const query = normalize(search ? search.value : "");
-
-    const matchingArtists = stats.artists.filter((artist) =>
-      normalize(artist.name).includes(query)
-    );
-
-    container.replaceChildren();
-
-    if (matchingArtists.length === 0) {
-      container.appendChild(
-        createElement(
-          "div",
-          "stats-empty",
-          query
-            ? "No matching artists found in this listening period."
-            : "No artist listening records found."
-        )
-      );
-      return;
-    }
-
-    matchingArtists.slice(0, 15).forEach((artist) => {
-      container.appendChild(createArtistButton(artist, true));
-    });
-  }
-
-  function createArtistButton(artist, showImage = false) {
-    const button = createElement("button", "stats-artist-button");
-    button.type = "button";
-
-    const identity = createElement("span", "stats-artist-identity");
-
-    if (showImage) {
-      const avatar = createElement("span", "stats-artist-avatar");
-      avatar.textContent = "♪";
-      avatar.setAttribute("aria-hidden", "true");
-      identity.appendChild(avatar);
-      loadArtistImage(artist.name, avatar);
-    }
-
-    const name = createElement("span", "stats-artist-name", artist.name);
-    identity.appendChild(name);
-
-    const plays = createElement(
-      "span",
-      "stats-artist-plays",
-      `${formatNumber(artist.plays)} plays`
-    );
-
-    button.append(identity, plays);
-
-    button.addEventListener("click", () => {
-      openArtistModal(artist.name);
-    });
-
-    return button;
-  }
-
-  function renderTopArtists(artists) {
-    const container = document.getElementById("stats-top-artists");
-    if (!container) return;
-
-    container.replaceChildren();
-
-    if (artists.length === 0) {
-      container.appendChild(
-        createElement("div", "stats-empty", "No artists found.")
-      );
-      return;
-    }
-
-    artists.slice(0, 10).forEach((artist) => {
-      container.appendChild(createArtistButton(artist, true));
-    });
-  }
-
-  function renderTopAlbums(albums) {
-    const container = document.getElementById("stats-top-albums");
-    if (!container) return;
-
-    container.replaceChildren();
-
-    if (albums.length === 0) {
-      container.appendChild(
-        createElement("div", "stats-empty", "No album information found.")
-      );
-      return;
-    }
-
-    albums.slice(0, 10).forEach((album) => {
-      const row = createElement("div", "stats-album-row");
-      const info = createElement("div");
-
-      info.appendChild(
-        createElement("div", "stats-album-name", album.name)
-      );
-      info.appendChild(
-        createElement("div", "stats-album-artist", album.artistName)
-      );
-
-      row.append(
-        info,
-        createElement(
-          "span",
-          "stats-album-count",
-          `${formatNumber(album.plays)} plays`
-        )
-      );
-
-      container.appendChild(row);
-    });
-  }
-
-  // --------------------------------------------------
-  // Monthly activity chart
-  // --------------------------------------------------
-
-  function renderMonthlyActivity() {
-    const container = document.getElementById("stats-monthly-chart");
-    if (!container) return;
-
-    container.replaceChildren();
-
-    const activity = getMonthlyActivity(dashboardRecords);
-
-    if (activity.length === 0) {
-      container.appendChild(
-        createElement("div", "stats-empty", "No monthly activity found.")
-      );
-      return;
-    }
-
-    const maxPlays = Math.max(...activity.map((item) => item[1]), 1);
-
-    activity.forEach(([key, plays]) => {
-      const [year, month] = key.split("-").map(Number);
-      const date = new Date(year, month - 1, 1);
-
-      const column = createElement("div", "stats-chart-column");
-      const barWrap = createElement("div", "stats-chart-bar-wrap");
-      const bar = createElement("div", "stats-chart-bar");
-
-      bar.style.height = `${Math.max(3, (plays / maxPlays) * 100)}%`;
-      bar.title = `${formatNumber(plays)} plays`;
-
-      barWrap.appendChild(bar);
-
-      const label = createElement(
-        "span",
-        "stats-chart-month",
-        date.toLocaleDateString(undefined, { month: "short" })
-      );
-
-      column.append(barWrap, label);
-      container.appendChild(column);
-    });
-  }
-
-  // --------------------------------------------------
-  // Artist details modal
-  // --------------------------------------------------
-
-  function createArtistModal() {
-    if (document.getElementById("stats-artist-modal")) return;
-
-    const modal = createElement("div", "stats-modal");
-    modal.id = "stats-artist-modal";
-    modal.hidden = true;
-    modal.setAttribute("role", "dialog");
-    modal.setAttribute("aria-modal", "true");
-    modal.setAttribute("aria-labelledby", "stats-modal-title");
-
-    const content = createElement("div", "stats-modal-content");
-
-    const header = createElement("div", "stats-modal-header");
-    const titleArea = createElement("div");
-
-    const title = createElement("h2");
-    title.id = "stats-modal-title";
-
-    const subtitle = createElement("div", "stats-modal-subtitle");
-    subtitle.id = "stats-modal-subtitle";
-
-    titleArea.append(title, subtitle);
-
-    const close = createElement("button", "stats-modal-close", "×");
-    close.type = "button";
-    close.setAttribute("aria-label", "Close artist details");
-    close.addEventListener("click", closeArtistModal);
-
-    header.append(titleArea, close);
-
-    const metrics = createElement("div", "stats-modal-metrics");
-    metrics.id = "stats-modal-metrics";
-
-    const songsHeading = createElement("h3", "", "MOST PLAYED SONGS");
-    const songs = createElement("div", "stats-modal-list");
-    songs.id = "stats-modal-songs";
-
-    const albumsHeading = createElement("h3", "", "TOP ALBUMS");
-    const albums = createElement("div", "stats-modal-list");
-    albums.id = "stats-modal-albums";
-
-    content.append(
-      header,
-      metrics,
-      songsHeading,
-      songs,
-      albumsHeading,
-      albums
-    );
-
-    modal.appendChild(content);
-
-    modal.addEventListener("click", (event) => {
-      if (event.target === modal) closeArtistModal();
-    });
-
-    document.addEventListener("keydown", (event) => {
-      if (event.key === "Escape" && !modal.hidden) {
-        closeArtistModal();
-      }
-    });
-
-    document.body.appendChild(modal);
-  }
-
-  function openArtistModal(artistName) {
-    const modal = document.getElementById("stats-artist-modal");
-    if (!modal) return;
-
-    const stats = calculateStatistics(getFilteredRecords());
-
-    const artist = stats.artists.find(
-      (item) => normalize(item.name) === normalize(artistName)
-    );
-
-    if (!artist) return;
-
-    document.getElementById("stats-modal-title").textContent = artist.name;
-
-    document.getElementById("stats-modal-subtitle").textContent =
-      selectedPeriod === "month"
-        ? "Personal listening statistics · Past 30 days"
-        : "Personal listening statistics · All time";
-
-    const totalDuration = artist.duration;
-    const share = stats.totalDuration > 0
-      ? ((totalDuration / stats.totalDuration) * 100).toFixed(1)
-      : "0.0";
-
-    const metrics = document.getElementById("stats-modal-metrics");
-    metrics.replaceChildren();
-
-    [
-      ["PLAYS", formatNumber(artist.plays)],
-      ["UNIQUE SONGS", formatNumber(artist.tracks.size)],
-      ["LISTENING SHARE", `${share}%`]
-    ].forEach(([label, value]) => {
-      const metric = createElement("div", "stats-modal-metric");
-      metric.append(
-        createElement("strong", "", value),
-        createElement("span", "", label)
-      );
-      metrics.appendChild(metric);
-    });
-
-    const songs = document.getElementById("stats-modal-songs");
-    songs.replaceChildren();
-
-    const topTracks = [...artist.tracks.values()]
-      .sort((a, b) => b.plays - a.plays)
-      .slice(0, 10);
-
-    if (topTracks.length === 0) {
-      songs.appendChild(
-        createElement("div", "stats-empty", "No songs found.")
-      );
-    } else {
-      topTracks.forEach((track) => {
-        songs.appendChild(
-          createModalListItem(track.name, `${formatNumber(track.plays)} plays`)
-        );
-      });
-    }
-
-    const albums = document.getElementById("stats-modal-albums");
-    albums.replaceChildren();
-
-    const topAlbums = [...artist.albums.values()]
-      .sort((a, b) => b.plays - a.plays)
-      .slice(0, 10);
-
-    if (topAlbums.length === 0) {
-      albums.appendChild(
-        createElement("div", "stats-empty", "No album information found.")
-      );
-    } else {
-      topAlbums.forEach((album) => {
-        albums.appendChild(
-          createModalListItem(album.name, `${formatNumber(album.plays)} plays`)
-        );
-      });
-    }
-
-    modal.hidden = false;
-    document.body.style.overflow = "hidden";
-  }
-
-  function createModalListItem(name, value) {
-    const item = createElement("div", "stats-modal-list-item");
-
-    item.append(
-      createElement("span", "", name),
-      createElement("span", "", value)
-    );
-
-    return item;
-  }
-
-  function closeArtistModal() {
-    const modal = document.getElementById("stats-artist-modal");
-
-    if (modal) modal.hidden = true;
-    document.body.style.overflow = "";
-  }
-
-  // --------------------------------------------------
-  // Start and return from dashboard
-  // --------------------------------------------------
-
-  function startStatistics() {
-    if (!currentFile || !isValidated || validatedRecords.length === 0) {
-      return;
-    }
-
-    dashboardRecords = validatedRecords.slice();
-    selectedPeriod = "month";
-
-    // Reset metadata state for the newly imported listening history.
-    artistMetadataCache.clear();
-    artistImageCache.clear();
-    artistMetadataRequests.clear();
-
-    metadataLoading = false;
-    metadataLoadedCount = 0;
-    metadataTotalCount = 0;
-
-    createDashboard();
-
-    // Release the original upload references after creating the dashboard.
-    validatedRecords = [];
-    currentFile = null;
-    isValidated = false;
-  }
-
-  function returnToUpload() {
-    const dashboard = document.getElementById("stats-dashboard");
-    const modal = document.getElementById("stats-artist-modal");
+  function restoreUploadView() {
+    const dashboard = document.querySelector(".stats-dashboard");
 
     if (dashboard) dashboard.remove();
-    if (modal) modal.remove();
-
-    const uploadSection = document.querySelector(".upload-section");
-    if (uploadSection) uploadSection.hidden = false;
 
     // Restore the privacy disclosure to its original upload-page position.
     if (privacyCard && privacyCardOriginalParent) {
@@ -2031,38 +1900,63 @@
       } else {
         privacyCardOriginalParent.appendChild(privacyCard);
       }
+
       privacyCard.hidden = false;
     }
 
-    dashboardRecords = [];
-    selectedPeriod = "month";
+    const uploadSection = document.querySelector(".upload-section");
 
-    artistMetadataCache.clear();
-    artistImageCache.clear();
-    artistMetadataRequests.clear();
+    if (uploadSection) {
+      uploadSection.hidden = false;
+    }
 
-    metadataLoading = false;
-    metadataLoadedCount = 0;
-    metadataTotalCount = 0;
+    if (dropZone) dropZone.hidden = false;
+    if (selectedFile) selectedFile.hidden = true;
+    if (processButton) processButton.hidden = false;
 
-    resetUpload();
+    setButtonState(false);
+  }
 
-    window.scrollTo({ top: 0, behavior: "smooth" });
+  function showDashboard() {
+    const uploadSection = document.querySelector(".upload-section");
+
+    if (uploadSection) {
+      uploadSection.hidden = true;
+    }
+
+    if (dropZone) dropZone.hidden = true;
+    if (selectedFile) selectedFile.hidden = true;
+    if (processButton) processButton.hidden = true;
+
+    buildDashboard();
+    loadAllArtistMetadata();
+    loadAllAlbumCovers();
+  }
+
+  // --------------------------------------------------
+  // Process listening history
+  // --------------------------------------------------
+
+  async function processListeningHistory() {
+    if (!isValidated || !validatedRecords.length) {
+      showMessage("Please select and validate your Spotify ZIP file first.");
+      return;
+    }
+
+    dashboardRecords = validatedRecords.slice();
+    selectedPeriod = "all";
+
+    showDashboard();
   }
 
   if (processButton) {
-    processButton.addEventListener("click", startStatistics);
+    processButton.addEventListener("click", processListeningHistory);
   }
 
   // --------------------------------------------------
-  // Clear imported data when leaving the page
+  // Initial page state
   // --------------------------------------------------
 
-  window.addEventListener("pagehide", () => {
-    currentFile = null;
-    validatedRecords = [];
-    dashboardRecords = [];
-    isValidated = false;
-  });
+  restoreUploadView();
 
 })();
