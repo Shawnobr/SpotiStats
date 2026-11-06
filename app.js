@@ -1758,10 +1758,13 @@
   function buildDashboard() {
     addDashboardStyles();
 
-    const uploadContainer =
-      document.querySelector(".upload-section") ||
-      document.querySelector("main") ||
-      document.body;
+const uploadSection = document.querySelector(".upload-section");
+
+const uploadContainer =
+  uploadSection?.parentElement ||
+  document.querySelector(".page-shell") ||
+  document.querySelector("main") ||
+  document.body;
 
     const dashboard = createElement("section", "stats-dashboard");
     dashboard.innerHTML = `
